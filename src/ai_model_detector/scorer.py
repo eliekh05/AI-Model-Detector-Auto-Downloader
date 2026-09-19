@@ -9,8 +9,8 @@ thresholds are hardcoded — everything is computed from the system profile.
 import logging
 from dataclasses import dataclass, field
 
-from .scanner import SystemProfile, GPUDevice
 from .registry import ModelInfo
+from .scanner import SystemProfile
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +38,7 @@ def _best_gpu(profile: SystemProfile) -> tuple[float, bool, bool, bool]:
     has_rocm  = False
     for gpu in profile.gpus:
         vram = gpu.vram_gb or 0.0
-        if vram > max_vram:
-            max_vram = vram
+        max_vram = max(max_vram, vram)
         if gpu.cuda_version:
             has_cuda = True
         if gpu.metal_support:
@@ -192,6 +191,19 @@ def score_model(model: ModelInfo, profile: SystemProfile) -> ScoredModel:
         explanation.append("Very popular model (1M+ pulls) — well-tested.")
     elif model.ollama_pull_count > 100_000:
         score += 2
+
+    # ── Installability — Ollama-pullable models get a strong bonus ────────────
+    # HuggingFace-only models cannot be installed with `ollama pull` and require
+    # manual download steps, so we rank them well below Ollama library models.
+    if not model.ollama_pullable:
+        score -= 25
+        warnings.append(
+            "HuggingFace-only model — cannot be installed via `ollama pull`. "
+            "Manual download required (see https://huggingface.co)."
+        )
+    else:
+        score += 8
+        explanation.append("Installable with a single `ollama pull` command.")
 
     score = max(0.0, min(100.0, round(score, 1)))
     speed = _speed_label(model, avail_ram, max_vram, has_gpu)

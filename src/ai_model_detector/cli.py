@@ -17,22 +17,25 @@ import logging
 import sys
 from pathlib import Path
 
-from rich.console import Console
 from rich.prompt import Confirm, Prompt
 
 from . import __version__
-from .scanner import scan_system
-from .registry import fetch_registry
-from .scorer import rank_models
-from .downloader import pull_model, list_installed_models, start_ollama_serve, DownloadResult
 from .display import (
     console,
     print_banner,
-    print_system_profile,
-    print_recommendations,
     print_download_result,
+    print_recommendations,
+    print_system_profile,
     spinner,
 )
+from .downloader import (
+    list_installed_models,
+    pull_model,
+    start_ollama_serve,
+)
+from .registry import fetch_registry
+from .scanner import scan_system
+from .scorer import rank_models
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +122,7 @@ def run() -> None:
     scan_label = f"Importing {spx_path.name}" if spx_path else "Scanning system hardware"
 
     with spinner(scan_label) as prog:
-        task = prog.add_task("", total=None)
+        prog.add_task("", total=None)
         profile = scan_system(spx_path=spx_path)
 
     print_system_profile(profile)
@@ -181,18 +184,24 @@ def run() -> None:
     print_recommendations(ranked, top=args.top)
 
     # ── Interactive download ──────────────────────────────────────────────────
-    top_model = ranked[0]
+    # Always install from Ollama library — HuggingFace-only models cannot be
+    # pulled via `ollama pull` and must be downloaded manually.
+    pullable = [sm for sm in ranked if sm.model.ollama_pullable]
+    top_pullable = pullable[0] if pullable else None
     console.print()
 
-    if Confirm.ask(
+    if top_pullable is None:
+        console.print(
+            "[yellow]All top recommendations require manual download — "
+            "no Ollama-library models found in the live registry right now.[/]"
+        )
+    elif Confirm.ask(
         f"[bold]Install top recommendation[/] "
-        f"[cyan]{top_model.model.full_tag}[/]?"
+        f"[cyan]{top_pullable.model.full_tag}[/] via `ollama pull`?"
     ):
         start_ollama_serve()
-
-        target = top_model.model.full_tag
+        target = top_pullable.model.full_tag
         console.print(f"\n[cyan]Pulling {target}…[/]  (this may take a while)\n")
-
         result, msg = pull_model(
             target,
             on_output=lambda line: console.print(f"  [dim]{line}[/]"),
@@ -200,26 +209,29 @@ def run() -> None:
         print_download_result(result, msg)
 
     else:
-        # Let the user pick a different model from the list
-        choices = {str(i + 1): sm.model.full_tag for i, sm in enumerate(ranked[:args.top])}
-        choices["s"] = "skip"
+        # Let the user pick from Ollama-pullable models only
+        pullable_choices = {
+            str(i + 1): sm.model.full_tag
+            for i, sm in enumerate(pullable[:args.top])
+        }
+        pullable_choices["s"] = "skip"
 
-        console.print("\n[dim]Available options:[/]")
-        for k, v in choices.items():
+        console.print("\n[dim]Ollama-installable options:[/]")
+        for k, v in pullable_choices.items():
             if k != "s":
                 console.print(f"  [{k}] {v}")
         console.print("  [s] Skip / exit\n")
 
         choice = Prompt.ask(
-            "Enter number to install another model, or 's' to skip",
-            choices=list(choices.keys()),
+            "Enter number to install, or 's' to skip",
+            choices=list(pullable_choices.keys()),
             default="s",
         )
 
         if choice != "s":
-            target = choices[choice]
+            target = pullable_choices[choice]
             start_ollama_serve()
-            console.print(f"\n[cyan]Pulling {target}…[/]\n")
+            console.print(f"\n[cyan]Pulling {target}…[/]  (this may take a while)\n")
             result, msg = pull_model(
                 target,
                 on_output=lambda line: console.print(f"  [dim]{line}[/]"),

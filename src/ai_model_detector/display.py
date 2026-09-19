@@ -2,13 +2,11 @@
 display.py — Rich terminal UI for scan results and recommendations.
 """
 
-from rich.console import Console
-from rich.table import Table
-from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
-from rich.text import Text
-from rich.columns import Columns
 from rich import box
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.table import Table
 
 from .scanner import SystemProfile
 from .scorer import ScoredModel
@@ -91,9 +89,13 @@ def print_recommendations(scored: list[ScoredModel], top: int = 5) -> None:
         m = sm.model
         score_color = "green" if sm.score >= 70 else "yellow" if sm.score >= 45 else "red"
 
+        install_badge = (
+            "[green]● ollama pull[/]" if m.ollama_pullable
+            else "[yellow]● manual download (HuggingFace)[/]"
+        )
         title = (
             f"[bold]#{rank}[/]  [white]{m.full_tag}[/]  "
-            f"[{score_color}]Score: {sm.score:.0f}/100[/]"
+            f"[{score_color}]Score: {sm.score:.0f}/100[/]  {install_badge}"
         )
 
         body_lines = []
@@ -107,7 +109,7 @@ def print_recommendations(scored: list[ScoredModel], top: int = 5) -> None:
         if m.categories:
             body_lines.append(f"[dim]Categories:[/] {', '.join(m.categories)}")
 
-        if m.description:
+        if m.description and "HuggingFace" not in m.description[:15]:
             body_lines.append(f"[dim]{m.description[:120]}[/]")
 
         for line in sm.explanation[:3]:

@@ -6,18 +6,25 @@ If Ollama isn't installed, provides platform-specific install instructions
 and fallback GGUF download guidance.
 """
 
-import os
-import sys
-import shutil
-import platform
-import subprocess
-import threading
-import time
 import logging
+import platform
+import re
+import shutil
+import subprocess
+import time
+from collections.abc import Callable
 from enum import Enum
-from typing import Optional, Callable
 
 logger = logging.getLogger(__name__)
+
+# Strip ANSI escape sequences (colour codes, cursor-movement codes, etc.)
+# ollama's progress bar uses these heavily and they corrupt Rich panels.
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\r")
+
+
+def _clean(text: str) -> str:
+    """Remove ANSI escape codes and bare carriage returns from a string."""
+    return _ANSI_ESCAPE.sub("", text).strip()
 
 
 class DownloadResult(Enum):
@@ -82,7 +89,7 @@ def _get_gguf_fallback(model_name: str) -> str:
 
 def pull_model(
     model_tag: str,
-    on_output: Optional[Callable[[str], None]] = None,
+    on_output: Callable[[str], None] | None = None,
     check_existing: bool = True,
 ) -> tuple[DownloadResult, str]:
     """
@@ -118,17 +125,23 @@ def pull_model(
         output_lines: list[str] = []
 
         for line in process.stdout:  # type: ignore[union-attr]
-            stripped = line.rstrip()
-            output_lines.append(stripped)
-            if on_output:
-                on_output(stripped)
+            cleaned = _clean(line)
+            if cleaned:                  # skip blank / pure-escape lines
+                output_lines.append(cleaned)
+                if on_output:
+                    on_output(cleaned)
 
         process.wait()
 
         if process.returncode == 0:
             return DownloadResult.SUCCESS, f"Model '{model_tag}' downloaded successfully."
         else:
-            err = "\n".join(output_lines[-10:])
+            # Only keep lines that look like actual error messages
+            error_lines = [
+                ln for ln in output_lines
+                if ln.startswith("Error") or "error" in ln.lower() or "failed" in ln.lower()
+            ] or output_lines[-5:]
+            err = "\n".join(error_lines)
             return DownloadResult.PULL_FAILED, f"ollama pull failed:\n{err}"
 
     except KeyboardInterrupt:
@@ -143,7 +156,7 @@ def pull_model(
         return DownloadResult.PULL_FAILED, f"Unexpected error: {exc}"
 
 
-def start_ollama_serve() -> Optional[subprocess.Popen]:
+def start_ollama_serve() -> subprocess.Popen | None:
     """
     Ensure the Ollama server is running.
     Returns the subprocess if we started it, None if it was already running.

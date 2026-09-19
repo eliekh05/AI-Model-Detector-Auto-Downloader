@@ -30,6 +30,12 @@ dependencies = [
     "pyyaml>=6.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
+
 [project.urls]
 Homepage = "https://github.com/eliekh05/AI-Model-Detector-Auto-Downloader"
 Issues   = "https://github.com/eliekh05/AI-Model-Detector-Auto-Downloader/issues"
@@ -42,3 +48,17 @@ where = ["src"]
 
 [tool.setuptools.package-dir]
 "" = "src"
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+# BLE001: broad exception in subprocess/OS helpers is intentional — we never
+#         want a hardware-probe or network call to crash the whole program.
+# S110:   try/except/pass is deliberate for best-effort system probing.
+# PLW1510: check= omitted intentionally on subprocess.run when returncode is
+#           checked via other means or errors are caught explicitly.
+ignore = ["BLE001", "S110", "PLW1510"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

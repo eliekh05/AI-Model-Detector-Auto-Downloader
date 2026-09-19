@@ -6,11 +6,10 @@ sources at runtime to build a fresh model list. Nothing is hardcoded —
 the registry is always fetched fresh so new models appear automatically.
 """
 
-import re
 import json
 import logging
+import re
 from dataclasses import dataclass, field
-from typing import Optional
 
 import requests
 
@@ -47,11 +46,12 @@ class ModelInfo:
     hf_downloads: int = 0         # Hugging Face download count (0 if N/A)
     ollama_pull_count: int = 0    # from Ollama library page
     source: str = "ollama"        # "ollama" | "huggingface"
+    ollama_pullable: bool = True   # False for HF-only models that need manual download
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-def _http_get(url: str, params: Optional[dict] = None, timeout: int = REQUEST_TIMEOUT) -> Optional[requests.Response]:
+def _http_get(url: str, params: dict | None = None, timeout: int = REQUEST_TIMEOUT) -> requests.Response | None:
     try:
         headers = {"User-Agent": USER_AGENT}
         resp = requests.get(url, params=params, headers=headers, timeout=timeout)
@@ -131,8 +131,8 @@ def _fetch_ollama_library() -> list[ModelInfo]:
             r'href="/library/([a-zA-Z0-9_.-]+)"[^>]*>[^<]*<h2[^>]*>\s*([^<]+)\s*</h2>',
             re.DOTALL,
         )
-        pull_pattern = re.compile(r"([\d.]+[KMB]?)\s*[Pp]ulls?")
-        desc_pattern = re.compile(r'<p[^>]*class="[^"]*description[^"]*"[^>]*>(.*?)</p>', re.DOTALL)
+        re.compile(r"([\d.]+[KMB]?)\s*[Pp]ulls?")
+        re.compile(r'<p[^>]*class="[^"]*description[^"]*"[^>]*>(.*?)</p>', re.DOTALL)
 
         for m in name_pattern.finditer(html):
             slug = m.group(1)
@@ -143,8 +143,7 @@ def _fetch_ollama_library() -> list[ModelInfo]:
     if api_resp:
         try:
             api_data = api_resp.json()
-            for item in api_data.get("models", []):
-                raw_models.append(item)
+            raw_models.extend(api_data.get("models", []))
         except Exception:
             pass
 
@@ -276,10 +275,11 @@ def _fetch_hf_popular_models(limit: int = 30) -> list[ModelInfo]:
                 ram_required_gb=0.0,
                 vram_required_gb=0.0,
                 quantization="gguf",
-                description=description or f"HuggingFace model: {model_id}",
+                description=description or f"HuggingFace GGUF (manual download): {model_id}",
                 categories=categories,
                 hf_downloads=downloads,
                 source="huggingface",
+                ollama_pullable=False,   # must be downloaded manually, not via ollama pull
             ))
     except Exception as exc:
         logger.warning("HuggingFace parse error: %s", exc)
@@ -344,9 +344,13 @@ def fetch_registry(include_hf: bool = True) -> list[ModelInfo]:
                 matched.extend(titles[:2])
         m.known_issues = matched[:4]
 
-    # Sort: Ollama pull count desc, then HF downloads desc
+    # Sort: Ollama-pullable models first (can be installed with one command),
+    # then by popularity, with HF-only models at the end.
     all_models.sort(
-        key=lambda m: (m.ollama_pull_count + m.hf_downloads),
-        reverse=True
+        key=lambda m: (
+            int(m.ollama_pullable),          # 1 for Ollama, 0 for HF-only → descending puts Ollama first
+            m.ollama_pull_count + m.hf_downloads,
+        ),
+        reverse=True,
     )
     return all_models

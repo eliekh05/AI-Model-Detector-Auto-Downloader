@@ -6,17 +6,14 @@ a full hardware profile used for model recommendation scoring.
 Supports .spx imports on macOS (system_profiler XML exports).
 """
 
-import os
-import sys
-import platform
-import subprocess
-import shutil
 import json
+import platform
 import plistlib
+import shutil
+import subprocess
 import zipfile
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Optional
 
 import psutil
 
@@ -38,17 +35,17 @@ class CPUProfile:
 class RAMProfile:
     total_gb: float
     available_gb: float
-    speed_mhz: Optional[int]  # may not be detectable on all platforms
+    speed_mhz: int | None  # may not be detectable on all platforms
 
 
 @dataclass
 class GPUDevice:
     name: str
-    vram_gb: Optional[float]
-    driver_version: Optional[str]
+    vram_gb: float | None
+    driver_version: str | None
     metal_support: bool        # macOS Metal
-    cuda_version: Optional[str]
-    rocm_version: Optional[str]
+    cuda_version: str | None
+    rocm_version: str | None
     vulkan_support: bool
 
 
@@ -67,9 +64,9 @@ class SystemProfile:
     cpu: CPUProfile
     ram: RAMProfile
     gpus: list[GPUDevice] = field(default_factory=list)
-    disk: Optional[DiskProfile] = None
+    disk: DiskProfile | None = None
     ollama_installed: bool = False
-    ollama_version: Optional[str] = None
+    ollama_version: str | None = None
     source: str = "live_scan"   # "live_scan" | "spx_import"
 
     def to_dict(self) -> dict:
@@ -98,22 +95,36 @@ def _detect_cpu_flags() -> dict:
             pass
 
     elif system == "Darwin":
+        # machdep.cpu.features  → legacy SSE/AVX flags (AVX1.0, F16C …)
+        # machdep.cpu.leaf7_features → newer flags (AVX2, BMI1/2, AVX512 …)
+        # We must query BOTH because AVX2 only appears in leaf7_features on Intel Macs.
         try:
-            result = subprocess.run(
+            r1 = subprocess.run(
                 ["sysctl", "-n", "machdep.cpu.features"],
-                capture_output=True, text=True, timeout=5
+                capture_output=True, text=True, timeout=5, check=False,
             )
-            feat = result.stdout.upper()
-            flags["avx"]    = "AVX1.0" in feat or "AVX " in feat
-            flags["avx2"]   = "AVX2" in feat
-            flags["avx512f"]= "AVX512F" in feat
-            flags["f16c"]   = "F16C" in feat
+            feat = r1.stdout.upper()
         except Exception:
-            pass
+            feat = ""
+
+        try:
+            r2 = subprocess.run(
+                ["sysctl", "-n", "machdep.cpu.leaf7_features"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            leaf7 = r2.stdout.upper()
+        except Exception:
+            leaf7 = ""
+
+        combined = feat + " " + leaf7
+        flags["avx"]     = "AVX1.0" in combined or "AVX " in combined
+        flags["avx2"]    = "AVX2" in combined
+        flags["avx512f"] = "AVX512F" in combined
+        flags["f16c"]    = "F16C" in combined
 
     elif system == "Windows":
         try:
-            result = subprocess.run(
+            subprocess.run(
                 ["wmic", "cpu", "get", "Caption,Name"],
                 capture_output=True, text=True, timeout=10
             )
@@ -176,7 +187,7 @@ def _scan_cpu() -> CPUProfile:
 
 # ── RAM helpers ────────────────────────────────────────────────────────────────
 
-def _ram_speed_mhz() -> Optional[int]:
+def _ram_speed_mhz() -> int | None:
     system = platform.system()
     if system == "Linux":
         try:
@@ -418,7 +429,7 @@ def _scan_disk() -> DiskProfile:
 
 # ── Ollama detection ───────────────────────────────────────────────────────────
 
-def _detect_ollama() -> tuple[bool, Optional[str]]:
+def _detect_ollama() -> tuple[bool, str | None]:
     if not shutil.which("ollama"):
         return False, None
     try:
@@ -506,7 +517,7 @@ def _parse_spx(spx_path: Path) -> SystemProfile:
 
 # ── Main scan ─────────────────────────────────────────────────────────────────
 
-def scan_system(spx_path: Optional[Path] = None) -> SystemProfile:
+def scan_system(spx_path: Path | None = None) -> SystemProfile:
     """
     Run a full system scan and return a SystemProfile.
     If spx_path is provided, import hardware data from a macOS .spx file.
