@@ -170,13 +170,20 @@ def _cpu_brand() -> str:
 
 
 def _scan_cpu() -> CPUProfile:
-    freq = psutil.cpu_freq()
+    # psutil.cpu_freq() is unavailable on macOS ARM (Apple Silicon)
+    # and some CI environments — always guard with try/except.
+    try:
+        freq = psutil.cpu_freq()
+        freq_max = freq.max if freq else 0.0
+    except (AttributeError, NotImplementedError, RuntimeError):
+        freq_max = 0.0
+
     flags = _detect_cpu_flags()
     return CPUProfile(
         brand=_cpu_brand(),
         cores_physical=psutil.cpu_count(logical=False) or 1,
         cores_logical=psutil.cpu_count(logical=True) or 1,
-        frequency_max_mhz=freq.max if freq else 0.0,
+        frequency_max_mhz=freq_max,
         architecture=platform.machine(),
         supports_avx=flags["avx"],
         supports_avx2=flags["avx2"],
