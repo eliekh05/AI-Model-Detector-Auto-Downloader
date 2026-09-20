@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 OLLAMA_LIBRARY_URL = "https://ollama.com/library"
 OLLAMA_API_SHOW_URL = "https://ollama.com/api/show"
 OLLAMA_SEARCH_URL   = "https://ollama.com/search"
+OLLAMA_MODEL_API    = "https://ollama.com/api/models"  # undocumented but returns tag lists
 
 HF_API_URL = "https://huggingface.co/api/models"
 
@@ -89,116 +90,153 @@ def _ram_from_size(size_gb: float, has_gpu: bool) -> tuple[float, float]:
 
 def _fetch_ollama_library() -> list[ModelInfo]:
     """
-    Fetch the Ollama library page and parse the JSON-LD or embedded
-    model data. Falls back to the /search API if scraping fails.
+    Fetch the Ollama library and get real tags for each model.
+
+    Strategy:
+    1. Get the list of model slugs from ollama.com/search HTML
+    2. For each slug, fetch ollama.com/library/<slug> to get real tags + sizes
+    3. Only emit tag variants that actually exist — never append :latest blindly
     """
     models: list[ModelInfo] = []
 
-    # Try the Ollama search JSON API (undocumented but stable)
-    resp = _http_get(
-        OLLAMA_SEARCH_URL,
-        params={"q": "", "c": "", "o": "popular"},
-    )
+    # ── Step 1: get slug list ─────────────────────────────────────────────────
+    resp = _http_get(OLLAMA_SEARCH_URL, params={"q": "", "c": "", "o": "popular"})
     if resp is None:
         logger.warning("Could not reach Ollama search endpoint")
         return []
 
-    # The page returns HTML; extract embedded JSON data if available
     html = resp.text
 
-    # Try to parse JSON blocks embedded in <script type="application/json">
-    json_blocks = re.findall(
+    # Extract model slugs from href="/library/<slug>"
+    slugs: list[str] = []
+    seen_slugs: set[str] = set()
+    for m in re.finditer(r'href="/library/([a-zA-Z0-9_.-]+)"', html):
+        slug = m.group(1)
+        if slug not in seen_slugs:
+            seen_slugs.add(slug)
+            slugs.append(slug)
+
+    # Also try embedded JSON
+    for block in re.findall(
         r'<script[^>]*type=["\']application/json["\'][^>]*>(.*?)</script>',
-        html,
-        re.DOTALL,
-    )
-    raw_models = []
-    for block in json_blocks:
+        html, re.DOTALL,
+    ):
         try:
             data = json.loads(block)
-            if isinstance(data, list):
-                raw_models.extend(data)
-            elif isinstance(data, dict) and "models" in data:
-                raw_models.extend(data["models"])
+            items = data if isinstance(data, list) else data.get("models", [])
+            for item in items:
+                slug = item.get("name", "") or item.get("model", "")
+                if slug and slug not in seen_slugs:
+                    seen_slugs.add(slug)
+                    slugs.append(slug)
         except json.JSONDecodeError:
             pass
 
-    # Fallback: parse basic model cards from the HTML
-    if not raw_models:
-        # Find model name + description in the HTML structure
-        # e.g. <h2 ...>llama3.2</h2>
-        name_pattern = re.compile(
-            r'href="/library/([a-zA-Z0-9_.-]+)"[^>]*>[^<]*<h2[^>]*>\s*([^<]+)\s*</h2>',
-            re.DOTALL,
+    logger.info("Found %d model slugs on Ollama library", len(slugs))
+
+    # ── Step 2: fetch real tags for each model ────────────────────────────────
+    for slug in slugs[:60]:  # cap at 60 to avoid hammering the server
+        model_page = _http_get(f"https://ollama.com/library/{slug}/tags")
+        if model_page is None:
+            # Fallback: try to at least get the model page without /tags
+            model_page = _http_get(f"https://ollama.com/library/{slug}")
+
+        page_html = model_page.text if model_page else ""
+        description = ""
+        pull_count = 0
+
+        # Extract description
+        desc_m = re.search(
+            r'<p[^>]*class="[^"]*(?:description|subtitle)[^"]*"[^>]*>(.*?)</p>',
+            page_html, re.DOTALL,
         )
-        re.compile(r"([\d.]+[KMB]?)\s*[Pp]ulls?")
-        re.compile(r'<p[^>]*class="[^"]*description[^"]*"[^>]*>(.*?)</p>', re.DOTALL)
+        if desc_m:
+            description = re.sub(r"<[^>]+>", "", desc_m.group(1)).strip()
 
-        for m in name_pattern.finditer(html):
-            slug = m.group(1)
-            raw_models.append({"name": slug, "description": ""})
+        # Extract pull count
+        pull_m = re.search(r"([\d.]+[KMB]?)\s*[Pp]ulls?", page_html)
+        if pull_m:
+            raw = pull_m.group(1).upper()
+            try:
+                if raw.endswith("B"):
+                    pull_count = int(float(raw[:-1]) * 1_000_000_000)
+                elif raw.endswith("M"):
+                    pull_count = int(float(raw[:-1]) * 1_000_000)
+                elif raw.endswith("K"):
+                    pull_count = int(float(raw[:-1]) * 1_000)
+                else:
+                    pull_count = int(raw)
+            except ValueError:
+                pass
 
-    # Try the official API endpoint as another source
-    api_resp = _http_get("https://ollama.com/api/tags")
-    if api_resp:
-        try:
-            api_data = api_resp.json()
-            raw_models.extend(api_data.get("models", []))
-        except Exception:
-            pass
+        # Extract real tags from the tags page
+        # Pattern: <span ...>tagname</span> or href="/library/slug:tagname"
+        tag_entries: list[tuple[str, float]] = []  # (tag_name, size_gb)
 
-    seen: set[str] = set()
-    for item in raw_models:
-        name = item.get("name", "") or item.get("model", "")
-        if not name or name in seen:
+        # href pattern: /library/slug:tag
+        for tm in re.finditer(
+            rf'href="/library/{re.escape(slug)}:([a-zA-Z0-9_.\-]+)"',
+            page_html,
+        ):
+            tag_name = tm.group(1)
+            if tag_name and tag_name not in {t for t, _ in tag_entries}:
+                tag_entries.append((tag_name, 0.0))
+
+        # Size pattern near each tag: look for "X.XGB" or "X.X GB" near tag refs
+        # Try to extract size from the tags listing table
+        size_blocks = re.findall(
+            r'([a-zA-Z0-9_.\-]+)\s*[^<]*?([\d.]+\s*(?:GB|MB))',
+            page_html,
+        )
+        size_map: dict[str, float] = {}
+        for tag_candidate, size_str in size_blocks:
+            gb = _parse_size_to_gb(size_str)
+            if gb > 0 and len(tag_candidate) <= 30:
+                size_map[tag_candidate] = gb
+
+        # If no tags found from href pattern, try looking for tag name spans
+        if not tag_entries:
+            for tm in re.finditer(
+                r'<(?:span|code|td)[^>]*>\s*([a-zA-Z0-9][a-zA-Z0-9_.\-]{0,25})\s*</(?:span|code|td)>',
+                page_html,
+            ):
+                candidate = tm.group(1)
+                # Filter: must look like a valid Ollama tag
+                if (re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_.\-]*$', candidate)
+                        and candidate != slug
+                        and candidate not in {t for t, _ in tag_entries}):
+                    tag_entries.append((candidate, size_map.get(candidate, 0.0)))
+
+        # Update sizes from size_map
+        tag_entries = [
+            (tag, size_map.get(tag, size)) for tag, size in tag_entries
+        ]
+
+        categories = _infer_categories(slug, description)
+
+        if not tag_entries:
+            # We know this model exists but couldn't parse its tags —
+            # skip it rather than emitting a fake :latest that won't pull
+            logger.debug("No tags found for %s — skipping", slug)
             continue
-        seen.add(name)
 
-        description = item.get("description", "") or item.get("readme", "")[:200]
-        categories  = _infer_categories(name, description)
-
-        # If item has tags/sizes, expand each variant
-        tags = item.get("tags", []) or item.get("sizes", [])
-        if not tags:
-            # Build a single generic entry
-            models.append(ModelInfo(
-                name=name,
-                tag="latest",
-                full_tag=f"{name}:latest",
-                size_gb=0.0,
-                ram_required_gb=0.0,
-                vram_required_gb=0.0,
-                quantization="unknown",
-                description=description,
-                categories=categories,
-                source="ollama",
-            ))
-            continue
-
-        for tag in tags:
-            if isinstance(tag, dict):
-                tag_name  = tag.get("name", "latest")
-                size_str  = tag.get("size", "0")
-            else:
-                tag_name  = str(tag)
-                size_str  = "0"
-
-            size_gb = _parse_size_to_gb(str(size_str))
+        for tag_name, size_gb in tag_entries:
             ram_gb, vram_gb = _ram_from_size(size_gb, has_gpu=True)
             quant = _infer_quantization(tag_name)
 
             models.append(ModelInfo(
-                name=name,
+                name=slug,
                 tag=tag_name,
-                full_tag=f"{name}:{tag_name}",
+                full_tag=f"{slug}:{tag_name}",
                 size_gb=size_gb,
                 ram_required_gb=ram_gb,
                 vram_required_gb=vram_gb,
                 quantization=quant,
                 description=description,
                 categories=categories,
-                ollama_pull_count=item.get("pull_count", 0),
+                ollama_pull_count=pull_count,
                 source="ollama",
+                ollama_pullable=True,
             ))
 
     return models
@@ -316,6 +354,45 @@ def _fetch_known_issues() -> dict[str, list[str]]:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+def _fetch_local_ollama_models() -> list[ModelInfo]:
+    """
+    Query the local Ollama instance (localhost:11434) for installed models.
+    These are guaranteed pullable and have accurate size data.
+    """
+    try:
+        resp = _http_get("http://localhost:11434/api/tags", timeout=3)
+        if resp is None:
+            return []
+        data = resp.json()
+        models = []
+        for item in data.get("models", []):
+            full = item.get("name", "")
+            if ":" in full:
+                name, tag = full.rsplit(":", 1)
+            else:
+                name, tag = full, "latest"
+            size_bytes = item.get("size", 0)
+            size_gb = round(size_bytes / (1024**3), 2) if size_bytes else 0.0
+            ram_gb, vram_gb = _ram_from_size(size_gb, has_gpu=True)
+            models.append(ModelInfo(
+                name=name,
+                tag=tag,
+                full_tag=full,
+                size_gb=size_gb,
+                ram_required_gb=ram_gb,
+                vram_required_gb=vram_gb,
+                quantization=_infer_quantization(tag),
+                description="Already installed locally",
+                categories=_infer_categories(name, ""),
+                ollama_pull_count=0,
+                source="ollama",
+                ollama_pullable=True,
+            ))
+        return models
+    except Exception:
+        return []
+
+
 def fetch_registry(include_hf: bool = True) -> list[ModelInfo]:
     """
     Fetch the complete, live model registry from Ollama + optional HF.
@@ -325,6 +402,15 @@ def fetch_registry(include_hf: bool = True) -> list[ModelInfo]:
     logger.info("Fetching Ollama model registry…")
     ollama_models = _fetch_ollama_library()
     logger.info("Found %d Ollama model variants", len(ollama_models))
+
+    # Supplement with locally installed models (guaranteed correct tags + sizes)
+    local_models = _fetch_local_ollama_models()
+    logger.info("Found %d locally installed models", len(local_models))
+
+    # Merge: local models take precedence over scraped ones for same full_tag
+    local_tags = {m.full_tag for m in local_models}
+    ollama_models = [m for m in ollama_models if m.full_tag not in local_tags]
+    ollama_models = local_models + ollama_models
 
     hf_models: list[ModelInfo] = []
     if include_hf:
@@ -344,11 +430,13 @@ def fetch_registry(include_hf: bool = True) -> list[ModelInfo]:
                 matched.extend(titles[:2])
         m.known_issues = matched[:4]
 
-    # Sort: Ollama-pullable models first (can be installed with one command),
-    # then by popularity, with HF-only models at the end.
+    # Sort: Ollama-pullable first, then by popularity desc.
+    # Within Ollama models, prefer ones with known sizes (size_gb > 0) so the
+    # scorer can actually rank them by hardware fit rather than all tying.
     all_models.sort(
         key=lambda m: (
-            int(m.ollama_pullable),          # 1 for Ollama, 0 for HF-only → descending puts Ollama first
+            int(m.ollama_pullable),
+            int(m.size_gb > 0),           # known-size models rank above unknown
             m.ollama_pull_count + m.hf_downloads,
         ),
         reverse=True,
