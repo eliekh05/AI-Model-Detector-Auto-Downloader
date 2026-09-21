@@ -61,4 +61,7 @@ def _classify_gpu(gpus: list[GPUDevice], os_name: str, os_arch: str) -> tuple[GP
 
     # Discrete but unknown backend
     best_vram = max((g.vram_gb or 0.0) for g in gpus)
-    return GPUTier.INTEGRATED if best_vram == 0 else GPUTier.DISCRETE_CUDA, best_vram
+    return (
+    GPUTier.INTEGRATED if best_vram == 0 else GPUTier.DISCRETE_CUDA,
+    best_vram,
+  )
