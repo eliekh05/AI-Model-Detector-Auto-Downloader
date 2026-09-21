@@ -9,7 +9,14 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
 from .scanner import SystemProfile
-from .scorer import Confidence, GPUTier, RAMFit, ScoredModel
+from .scorer import (
+    AccelerationStatus,
+    Confidence,
+    GPUTier,
+    PerformanceBasis,
+    RAMFit,
+    ScoredModel,
+)
 
 console = Console()
 
@@ -27,7 +34,7 @@ def print_banner() -> None:
 
 def print_system_profile(profile: SystemProfile) -> None:
     table = Table(title="System Profile", box=box.ROUNDED, show_header=False)
-    table.add_column("Field", style="bold cyan", width=22)
+    table.add_column("Field", style="bold cyan", width=28)
     table.add_column("Value", style="white")
 
     table.add_row("OS", f"{profile.os_name} {profile.os_version[:40]}")
@@ -56,18 +63,33 @@ def print_system_profile(profile: SystemProfile) -> None:
     if profile.gpus:
         for i, gpu in enumerate(profile.gpus):
             label = f"GPU {i + 1}"
-            vram = f"{gpu.vram_gb:.1f} GB VRAM" if gpu.vram_gb else "VRAM unknown (shared)"
-            accel = []
+            if gpu.is_integrated or (gpu.vram_gb is None or gpu.vram_gb == 0):
+                mem = "integrated — shared system memory"
+            elif gpu.vram_gb:
+                mem = f"{gpu.vram_gb:.1f} GB dedicated VRAM"
+            else:
+                mem = "VRAM unknown"
+            backends = []
             if gpu.cuda_version:
-                accel.append(f"CUDA {gpu.cuda_version}")
+                backends.append(f"CUDA {gpu.cuda_version}")
             if gpu.metal_support:
-                accel.append("Metal")
+                backends.append("Metal")
             if gpu.rocm_version:
-                accel.append("ROCm")
-            accel_str = " / ".join(accel) or ""
-            table.add_row(label, f"{gpu.name} · {vram}" + (f" · {accel_str}" if accel_str else ""))
+                backends.append("ROCm")
+            backend_str = f" · APIs: {'/'.join(backends)}" if backends else ""
+            table.add_row(label, f"{gpu.name} · {mem}{backend_str}")
+
+        # Separate detection from usable LLM acceleration
+        from .scorer import _classify_gpu, acceleration_for_tier
+
+        tier, _ = _classify_gpu(profile.gpus, profile.os_name, profile.os_arch)
+        accel = acceleration_for_tier(tier)
+        table.add_row("GPU detected", "yes")
+        table.add_row("LLM acceleration", _accel_profile_str(accel, tier))
     else:
-        table.add_row("GPU", "[yellow]No GPU detected — CPU-only inference[/]")
+        table.add_row("GPU", "[yellow]No GPU detected[/]")
+        table.add_row("GPU detected", "no")
+        table.add_row("LLM acceleration", "CPU-only")
 
     if profile.disk:
         table.add_row(
@@ -86,12 +108,26 @@ def print_system_profile(profile: SystemProfile) -> None:
     console.print(table)
 
 
+def _accel_profile_str(accel: AccelerationStatus, tier: GPUTier) -> str:
+    if accel == AccelerationStatus.METAL_APPLE:
+        return "[green]Metal (Apple Silicon — established)[/]"
+    if accel == AccelerationStatus.CUDA:
+        return "[green]CUDA (discrete NVIDIA)[/]"
+    if accel == AccelerationStatus.ROCM:
+        return "[green]ROCm (discrete AMD)[/]"
+    if accel == AccelerationStatus.UNVERIFIED:
+        return "[yellow]unverified / backend-dependent[/] [dim](iGPU detected — scoring uses CPU-only)[/]"
+    if tier == GPUTier.NONE:
+        return "CPU-only"
+    return "CPU-only"
+
+
 def _ram_fit_badge(ram_fit: RAMFit) -> str:
     return {
-        RAMFit.FIT: "[green]FIT[/]",
+        RAMFit.FITS: "[green]FITS[/]",
         RAMFit.TIGHT: "[yellow]TIGHT[/]",
         RAMFit.RISKY: "[orange3]RISKY[/]",
-        RAMFit.OVER: "[red]DOES NOT FIT[/]",
+        RAMFit.OVER: "[red]DOES_NOT_FIT[/]",
         RAMFit.UNKNOWN: "[dim]UNKNOWN[/]",
     }[ram_fit]
 
@@ -105,28 +141,41 @@ def _confidence_badge(conf: Confidence) -> str:
     }[conf]
 
 
-def _gpu_tier_str(gpu_tier: GPUTier, will_use_gpu: bool) -> str:
-    if gpu_tier == GPUTier.APPLE_SILICON:
-        return "[green]Apple Silicon (Metal)[/]"
-    if gpu_tier in (GPUTier.DISCRETE_CUDA, GPUTier.DISCRETE_ROCM):
-        return "[green]Discrete GPU[/]" if will_use_gpu else "[yellow]Discrete GPU (partial)[/]"
-    if gpu_tier == GPUTier.INTEGRATED:
-        return "[yellow]Integrated GPU (unverified)[/]"
-    return "[dim]CPU only[/]"
+def _accel_badge(sm: ScoredModel) -> str:
+    if sm.acceleration == AccelerationStatus.METAL_APPLE:
+        return "[green]Metal (Apple Silicon)[/]"
+    if sm.acceleration == AccelerationStatus.CUDA:
+        return "[green]CUDA[/]" if sm.will_use_gpu else "[yellow]CUDA (partial/offload)[/]"
+    if sm.acceleration == AccelerationStatus.ROCM:
+        return "[green]ROCm[/]" if sm.will_use_gpu else "[yellow]ROCm (partial/offload)[/]"
+    if sm.acceleration == AccelerationStatus.UNVERIFIED:
+        return "[yellow]GPU detected — LLM accel unverified (CPU-only scoring)[/]"
+    return "[dim]CPU-only[/]"
 
 
-def print_recommendations(scored: list[ScoredModel], top: int = 5) -> None:
+def _perf_basis_str(basis: PerformanceBasis) -> str:
+    return {
+        PerformanceBasis.MEASURED: "measured",
+        PerformanceBasis.ESTIMATED: "estimated",
+        PerformanceBasis.INFERRED: "inferred",
+        PerformanceBasis.UNKNOWN: "unknown",
+    }[basis]
+
+
+def print_recommendations(scored: list[ScoredModel], top: int = 5, available_ram_gb: float | None = None) -> None:
     console.print()
     console.rule("[bold cyan]Model Recommendations[/]")
 
     for shown, sm in enumerate(scored[:top], start=1):
         m = sm.model
 
-        # ── Colour by RAM fit and disqualification ──────────────────────────
         if sm.disqualified:
             border = "red"
             fit_label = "[red]⛔ INCOMPATIBLE[/]"
-        elif sm.ram_fit == RAMFit.FIT:
+        elif sm.unverified or sm.ram_fit == RAMFit.UNKNOWN:
+            border = "dim"
+            fit_label = "[dim]? UNVERIFIED[/]"
+        elif sm.ram_fit == RAMFit.FITS:
             border = "green"
             fit_label = "[green]✓ FITS[/]"
         elif sm.ram_fit == RAMFit.TIGHT:
@@ -137,25 +186,29 @@ def print_recommendations(scored: list[ScoredModel], top: int = 5) -> None:
             fit_label = "[orange3]⚠ RISKY[/]"
         elif sm.ram_fit == RAMFit.OVER:
             border = "red"
-            fit_label = "[red]✗ TOO LARGE[/]"
+            fit_label = "[red]✗ DOES_NOT_FIT[/]"
         else:
             border = "dim"
-            fit_label = "[dim]? UNKNOWN SIZE[/]"
+            fit_label = "[dim]? UNKNOWN[/]"
 
         install_badge = "[green]● ollama pull[/]" if m.ollama_pullable else "[yellow]● manual download[/]"
+        verified_badge = "[green]verified[/]" if sm.verified else "[dim]UNVERIFIED[/]"
 
         title = (
             f"[bold]#{shown}[/]  [white]{m.full_tag}[/]  "
             f"Score: {sm.score:.0f}/100  "
-            f"{fit_label}  {install_badge}"
+            f"{fit_label}  {verified_badge}  {install_badge}"
         )
 
-        lines = []
+        lines: list[str] = []
 
-        # ── Size + quant ────────────────────────────────────────────────────
+        # Size / params / quant
         size_str = f"{m.size_gb:.1f} GB" if m.size_gb > 0 else "size unknown"
         quant_str = m.quantization if m.quantization != "unknown" else "quant unknown"
-        params_str = _approx_params(m.size_gb)
+        if sm.params_b is not None:
+            params_str = f"~{sm.params_b:g}B"
+        else:
+            params_str = "unknown"
         lines.append(
             f"[dim]Size:[/] {size_str}  "
             f"[dim]Params:[/] {params_str}  "
@@ -163,32 +216,48 @@ def print_recommendations(scored: list[ScoredModel], top: int = 5) -> None:
             f"[dim]Categories:[/] {', '.join(m.categories) or '?'}"
         )
 
-        # ── RAM budget ──────────────────────────────────────────────────────
+        # Why ranked here
+        if sm.rank_reason:
+            lines.append(f"[dim]Why here:[/] {sm.rank_reason}")
+
+        # Separated concerns
+        lines.append(
+            f"[dim]Installable:[/] {'yes' if sm.installable else 'no'}  "
+            f"[dim]Runtime compatible:[/] {'yes' if sm.runtime_compatible else 'no'}  "
+            f"[dim]Fit:[/] {_ram_fit_badge(sm.ram_fit)}  "
+            f"[dim]Mem confidence:[/] {_confidence_badge(sm.memory_confidence)}"
+        )
+
+        # RAM budget
+        avail = available_ram_gb
         if sm.estimated_total_ram_gb > 0:
+            avail_str = f"{avail:.1f} GB" if avail is not None else "see system profile"
             lines.append(
-                f"[dim]RAM needed:[/] ~{sm.estimated_total_ram_gb:.1f} GB  "
-                f"[dim]Available:[/] {sm.model.ram_required_gb or '?'} GB  "
-                f"[dim]Fit:[/] {_ram_fit_badge(sm.ram_fit)}"
+                f"[dim]Est. RAM needed:[/] ~{sm.estimated_total_ram_gb:.1f} GB  [dim]Available (system):[/] {avail_str}"
             )
             lines.append(f"  [dim]{sm.ram_budget_note}[/]")
+        elif sm.missing_metadata:
+            lines.append(f"[dim]Missing metadata:[/] {', '.join(sm.missing_metadata)}")
 
-        # ── Speed estimate ──────────────────────────────────────────────────
+        # Acceleration + performance
+        lines.append(
+            f"[dim]GPU detected:[/] {'yes' if sm.gpu_detected else 'no'}  [dim]LLM accel:[/] {_accel_badge(sm)}"
+        )
         if sm.estimated_tps > 0:
             lines.append(
-                f"[dim]Est. speed:[/] ~{sm.estimated_tps:.1f} tok/s  "
-                f"[dim]Confidence:[/] {_confidence_badge(sm.tps_confidence)}  "
-                f"[dim]Accel:[/] {_gpu_tier_str(sm.gpu_tier, sm.will_use_gpu)}"
+                f"[dim]Performance:[/] ~{sm.estimated_tps:.1f} tok/s "
+                f"({_perf_basis_str(sm.performance_basis)})  "
+                f"[dim]Confidence:[/] {_confidence_badge(sm.tps_confidence)}"
             )
+        else:
+            lines.append(f"[dim]Performance:[/] unknown ({_perf_basis_str(sm.performance_basis)})")
 
-        # ── Overall confidence ──────────────────────────────────────────────
         lines.append(f"[dim]Overall confidence:[/] {_confidence_badge(sm.confidence)}")
 
-        # ── Explanation bullets ─────────────────────────────────────────────
-        for line in sm.explanation[:4]:
+        for line in sm.explanation[:5]:
             lines.append(f"  [green]✔[/] {line}")
 
-        # ── Warnings ────────────────────────────────────────────────────────
-        for w in sm.warnings[:3]:
+        for w in sm.warnings[:4]:
             lines.append(f"  [yellow]⚠[/]  {w}")
 
         if m.known_issues:
@@ -202,16 +271,6 @@ def print_recommendations(scored: list[ScoredModel], top: int = 5) -> None:
                 padding=(0, 1),
             )
         )
-
-
-def _approx_params(size_gb: float) -> str:
-    """Derive approximate parameter count from file size at Q4 (~0.5 B/param)."""
-    if size_gb <= 0:
-        return "unknown"
-    params_b = size_gb / 0.5
-    if params_b < 1.0:
-        return f"~{params_b * 1000:.0f}M"
-    return f"~{params_b:.1f}B"
 
 
 def print_download_result(result_code, message: str) -> None:

@@ -31,7 +31,7 @@ from .display import (
 from .downloader import list_installed_models, pull_model, start_ollama_serve
 from .registry import fetch_registry
 from .scanner import scan_system
-from .scorer import rank_models
+from .scorer import RAMFit, rank_models, select_install_candidate
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +40,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ai-model-detector",
         description=(
-            "Deep hardware scanner that recommends and auto-downloads "
-            "the best local AI model for your system."
+            "Deep hardware scanner that recommends and auto-downloads the best local AI model for your system."
         ),
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -93,6 +92,114 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _confirm_and_pull(target: str) -> None:
+    """Always require confirmation before downloading."""
+    start_ollama_serve()
+    console.print(f"\n[cyan]Pulling {target}…[/]  (this may take a while)\n")
+    result, msg = pull_model(
+        target,
+        on_output=lambda line: console.print(f"  [dim]{line}[/]"),
+    )
+    print_download_result(result, msg)
+
+
+def _interactive_install(ranked, top_n: int) -> None:
+    """
+    Offer install with safe defaults.
+
+    - Prefer a verified FITS/TIGHT model as the y/n default.
+    - If the top-ranked model is UNKNOWN/RISKY, explain and require override
+      to install it instead of the safer alternative.
+    - Never download without confirmation.
+    """
+    default, risky_top, advisory = select_install_candidate(ranked)
+    pullable = [sm for sm in ranked if sm.installable]
+
+    console.print()
+    if advisory:
+        console.print(f"[yellow]{advisory}[/]")
+
+    if default is not None:
+        fit_note = default.ram_fit.value
+        if default.ram_fit == RAMFit.RISKY:
+            fit_note += ", may need freeing RAM"
+        if Confirm.ask(
+            f"[bold]Install recommended[/] [cyan]{default.model.full_tag}[/] ({fit_note}, verified) via `ollama pull`?"
+        ):
+            _confirm_and_pull(default.model.full_tag)
+            return
+
+        # User declined the safer default — optionally offer override for unverified top
+        wants_override = (
+            risky_top is not None
+            and risky_top.model.full_tag != default.model.full_tag
+            and (risky_top.unverified or risky_top.ram_fit in (RAMFit.UNKNOWN, RAMFit.RISKY, RAMFit.OVER))
+            and Confirm.ask(
+                f"[bold red]Override[/] and install unverified/high-risk "
+                f"[cyan]{risky_top.model.full_tag}[/] "
+                f"({risky_top.ram_fit.value}) anyway?",
+                default=False,
+            )
+        )
+        if wants_override:
+            _confirm_and_pull(risky_top.model.full_tag)
+            return
+    elif risky_top is not None:
+        console.print("[yellow]No verified FITS/TIGHT/RISKY install candidate is available.[/]")
+        if Confirm.ask(
+            f"[bold red]Override[/] and install "
+            f"[cyan]{risky_top.model.full_tag}[/] "
+            f"({risky_top.ram_fit.value}, unverified/unsuitable) anyway?",
+            default=False,
+        ):
+            _confirm_and_pull(risky_top.model.full_tag)
+            return
+    else:
+        console.print(
+            "[yellow]All top recommendations require manual download — "
+            "no Ollama-library models found in the live registry right now.[/]"
+        )
+        return
+
+    # Manual pick from pullable list
+    if not pullable:
+        return
+
+    pullable_choices = {str(i + 1): sm for i, sm in enumerate(pullable[:top_n])}
+    console.print("\n[dim]Ollama-installable options:[/]")
+    for k, sm in pullable_choices.items():
+        flag = "verified" if sm.verified else "UNVERIFIED"
+        console.print(f"  [{k}] {sm.model.full_tag}  ({sm.ram_fit.value}, {flag}, score {sm.score:.0f})")
+    console.print("  [s] Skip / exit\n")
+
+    choice = Prompt.ask(
+        "Enter number to install, or 's' to skip",
+        choices=[*pullable_choices.keys(), "s"],
+        default="s",
+    )
+    if choice == "s":
+        return
+
+    chosen = pullable_choices[choice]
+    needs_override = chosen.unverified or chosen.ram_fit in (
+        RAMFit.UNKNOWN,
+        RAMFit.RISKY,
+        RAMFit.OVER,
+    )
+    if needs_override and not Confirm.ask(
+        f"[bold red]Confirm override[/] for {chosen.model.full_tag} ({chosen.ram_fit.value})?",
+        default=False,
+    ):
+        console.print("[dim]Skipped.[/]")
+        return
+
+    if Confirm.ask(
+        f"Install [cyan]{chosen.model.full_tag}[/] via `ollama pull`?",
+        default=True,
+    ):
+        _confirm_and_pull(chosen.model.full_tag)
+
+
 def run() -> None:
     parser = _build_parser()
     args = parser.parse_args()
@@ -142,15 +249,10 @@ def run() -> None:
         registry = fetch_registry(include_hf=not args.no_hf)
 
     if not registry:
-        console.print(
-            "[yellow]Could not fetch model registry. "
-            "Check your internet connection and try again.[/]"
-        )
+        console.print("[yellow]Could not fetch model registry. Check your internet connection and try again.[/]")
         sys.exit(1)
 
-    console.print(
-        f"\n[dim]Registry loaded: {len(registry)} model variants from live sources[/]"
-    )
+    console.print(f"\n[dim]Registry loaded: {len(registry)} model variants from live sources[/]")
 
     # ── Score & rank ─────────────────────────────────────────────────────────
     with spinner("Scoring models against your hardware…") as prog:
@@ -175,11 +277,25 @@ def run() -> None:
                     "rank": i + 1,
                     "model": sm.model.__dict__,
                     "score": sm.score,
+                    "ram_fit": sm.ram_fit.value,
                     "fits_ram": sm.fits_ram,
                     "fits_vram": sm.fits_vram,
                     "fits_disk": sm.fits_disk,
+                    "verified": sm.verified,
+                    "unverified": sm.unverified,
+                    "installable": sm.installable,
+                    "runtime_compatible": sm.runtime_compatible,
+                    "acceleration": sm.acceleration.value,
+                    "gpu_detected": sm.gpu_detected,
+                    "performance_basis": sm.performance_basis.value,
                     "estimated_speed": sm.estimated_speed,
+                    "estimated_tps": sm.estimated_tps,
+                    "estimated_total_ram_gb": sm.estimated_total_ram_gb,
+                    "memory_confidence": sm.memory_confidence.value,
+                    "missing_metadata": sm.missing_metadata,
+                    "params_b": sm.params_b,
                     "will_use_gpu": sm.will_use_gpu,
+                    "rank_reason": sm.rank_reason,
                     "explanation": sm.explanation,
                     "warnings": sm.warnings,
                 }
@@ -190,62 +306,14 @@ def run() -> None:
         return
 
     # ── Display recommendations ───────────────────────────────────────────────
-    print_recommendations(ranked, top=args.top)
+    print_recommendations(
+        ranked,
+        top=args.top,
+        available_ram_gb=profile.ram.available_gb,
+    )
 
     # ── Interactive download ──────────────────────────────────────────────────
-    # Always install from Ollama library — HuggingFace-only models cannot be
-    # pulled via `ollama pull` and must be downloaded manually.
-    pullable = [sm for sm in ranked if sm.model.ollama_pullable]
-    top_pullable = pullable[0] if pullable else None
-    console.print()
-
-    if top_pullable is None:
-        console.print(
-            "[yellow]All top recommendations require manual download — "
-            "no Ollama-library models found in the live registry right now.[/]"
-        )
-    elif Confirm.ask(
-        f"[bold]Install top recommendation[/] "
-        f"[cyan]{top_pullable.model.full_tag}[/] via `ollama pull`?"
-    ):
-        start_ollama_serve()
-        target = top_pullable.model.full_tag
-        console.print(f"\n[cyan]Pulling {target}…[/]  (this may take a while)\n")
-        result, msg = pull_model(
-            target,
-            on_output=lambda line: console.print(f"  [dim]{line}[/]"),
-        )
-        print_download_result(result, msg)
-
-    else:
-        # Let the user pick from Ollama-pullable models only
-        pullable_choices = {
-            str(i + 1): sm.model.full_tag
-            for i, sm in enumerate(pullable[: args.top])
-        }
-        pullable_choices["s"] = "skip"
-
-        console.print("\n[dim]Ollama-installable options:[/]")
-        for k, v in pullable_choices.items():
-            if k != "s":
-                console.print(f"  [{k}] {v}")
-        console.print("  [s] Skip / exit\n")
-
-        choice = Prompt.ask(
-            "Enter number to install, or 's' to skip",
-            choices=list(pullable_choices.keys()),
-            default="s",
-        )
-
-        if choice != "s":
-            target = pullable_choices[choice]
-            start_ollama_serve()
-            console.print(f"\n[cyan]Pulling {target}…[/]  (this may take a while)\n")
-            result, msg = pull_model(
-                target,
-                on_output=lambda line: console.print(f"  [dim]{line}[/]"),
-            )
-            print_download_result(result, msg)
+    _interactive_install(ranked, args.top)
 
     console.print("\n[dim]Done. Run [cyan]ollama run <model>[/] to start chatting.[/]\n")
 

@@ -1,14 +1,22 @@
 """
 scorer.py — Hardware-aware model scoring engine.
 
-Architecture: two-layer evaluation
-  Layer 1 — Hardware Compatibility: can this model physically run?
-  Layer 2 — Quality Ranking: among runnable models, which is best?
+Architecture: multi-signal evaluation
+  1. Installability — can Ollama pull the model?
+  2. Runtime compatibility — does the detected runtime support it?
+  3. Memory fit — is there enough RAM (estimated from metadata)?
+  4. Acceleration — is usable LLM acceleration established (not merely GPU present)?
+  5. Performance — estimated / inferred / unknown (never claimed measured unless measured)
+  6. Ranking — among candidates, which is the best verified fit?
 
-A model that fails Layer 1 is not recommended, only listed as incompatible.
+Unknown size/RAM metadata never becomes a confirmed FITS. Unknown models stay
+discoverable but are labeled UNVERIFIED and ranked below verified fits.
 """
 
+from __future__ import annotations
+
 import logging
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -22,11 +30,11 @@ logger = logging.getLogger(__name__)
 
 
 class RAMFit(Enum):
-    FIT = "FIT"  # comfortably fits with headroom
-    TIGHT = "TIGHT"  # fits but barely; expect swapping under load
-    RISKY = "RISKY"  # may fit depending on context length / overhead
+    FITS = "FITS"  # comfortably fits with headroom
+    TIGHT = "TIGHT"  # fits but barely; expect pressure under load
+    RISKY = "RISKY"  # may fit depending on context length / closing apps
     OVER = "DOES_NOT_FIT"  # will not fit
-    UNKNOWN = "UNKNOWN"  # no size data available
+    UNKNOWN = "UNKNOWN"  # insufficient metadata — not a confirmed fit
 
 
 class GPUTier(Enum):
@@ -37,6 +45,23 @@ class GPUTier(Enum):
     NONE = "none"  # no GPU detected
 
 
+class AccelerationStatus(Enum):
+    """Usable LLM acceleration — distinct from mere GPU detection."""
+
+    CUDA = "cuda"
+    ROCM = "rocm"
+    METAL_APPLE = "metal_apple"
+    CPU_ONLY = "cpu_only"
+    UNVERIFIED = "unverified"  # GPU present but backend use not established
+
+
+class PerformanceBasis(Enum):
+    MEASURED = "measured"
+    ESTIMATED = "estimated"
+    INFERRED = "inferred"
+    UNKNOWN = "unknown"
+
+
 class Confidence(Enum):
     HIGH = "High"
     MEDIUM = "Medium"
@@ -44,90 +69,209 @@ class Confidence(Enum):
     UNKNOWN = "Unknown"
 
 
-# ── RAM budget calculator ──────────────────────────────────────────────────────
+# ── Constants ──────────────────────────────────────────────────────────────────
 
-# Overhead constants (all in GB) — based on empirical llama.cpp / Ollama data
-_OLLAMA_BASE_OVERHEAD_GB = 0.25  # Ollama server + runtime base
-_KV_CACHE_PER_GB_MODEL = 0.12  # typical KV cache as fraction of model size
-_ACTIVATION_OVERHEAD_GB = 0.10  # activation buffers
-_OS_RESERVED_GB = 0.50  # OS keeps ~512 MB for itself under load
-_SAFETY_HEADROOM_GB = 0.25  # conservative safety margin
+_OLLAMA_BASE_OVERHEAD_GB = 0.25
+_ACTIVATION_OVERHEAD_GB = 0.15
+_OS_RESERVED_GB = 0.50
+_SAFETY_HEADROOM_GB = 0.25
+_DEFAULT_CONTEXT_TOKENS = 4096
+# Integrated GPUs (and Apple unified) carve into the same system RAM pool.
+_IGPU_SHARED_RESERVE_GB = 0.75
 
-# Quantization RAM multipliers relative to fp16 (≈ 2 bytes/param)
-# These express (disk_bytes × multiplier) ≈ RAM_needed for inference
-_QUANT_RAM_MULTIPLIER: dict[str, float] = {
-    "f32": 2.00,  # unlikely to see in practice
-    "f16": 1.00,  # baseline
-    "bf16": 1.00,
-    "q8_0": 0.52,
-    "q6_k": 0.42,
-    "q5_k_m": 0.36,
-    "q5_k_s": 0.35,
-    "q5_0": 0.34,
-    "q4_k_m": 0.30,
-    "q4_k_s": 0.29,
-    "q4_0": 0.28,
-    "q3_k_m": 0.22,
-    "q3_k_s": 0.21,
-    "q2_k": 0.16,
-    "iq4_xs": 0.27,
-    "gguf": 0.30,  # generic GGUF unknown quant — assume q4-ish
-    "unknown": 0.30,
+# Bytes-per-parameter on disk for common quants (GGUF-ish averages).
+# Used only to *infer* size from a parameter-count tag when size_gb is missing.
+# Never presented as a confirmed measured size.
+_BYTES_PER_PARAM: dict[str, float] = {
+    "f32": 4.00,
+    "f16": 2.00,
+    "bf16": 2.00,
+    "q8_0": 1.05,
+    "q6_k": 0.80,
+    "q5_k_m": 0.70,
+    "q5_k_s": 0.68,
+    "q5_0": 0.65,
+    "q4_k_m": 0.55,
+    "q4_k_s": 0.53,
+    "q4_0": 0.50,
+    "q3_k_m": 0.40,
+    "q3_k_s": 0.38,
+    "q2_k": 0.30,
+    "iq4_xs": 0.48,
+    "gguf": 0.55,
+    "unknown": 0.55,  # assume Q4-class only for inference heuristics
 }
 
 
-def _ram_budget(model: ModelInfo, profile: SystemProfile) -> tuple[RAMFit, float, float, str]:
+# ── Metadata helpers ───────────────────────────────────────────────────────────
+
+
+def parse_param_count_b(model: ModelInfo) -> float | None:
     """
-    Calculate realistic RAM budget for running this model.
-
-    Returns:
-        (RAMFit, estimated_model_ram_gb, total_required_gb, calculation_note)
+    Extract approximate parameter count (billions) from tag/name when present.
+    Examples: '30b', '3.2b', '7b-instruct', 'llama3.2:1b'.
+    Returns None when no reliable signal exists — never invents a count.
     """
-    size_gb = model.size_gb
+    text = f"{model.tag} {model.name} {model.full_tag}".lower()
+    match = re.search(r"(?<![a-z0-9])(\d+(?:\.\d+)?)\s*b(?:illion)?(?![a-z0-9])", text)
+    if not match:
+        # Also accept patterns glued to quant: 30b-q4_k_m
+        match = re.search(r"(?<![a-z0-9])(\d+(?:\.\d+)?)b(?=[-_]|$)", text)
+    if not match:
+        return None
+    value = float(match.group(1))
+    # Guard against nonsense (e.g. matching years); LLMs today are < 1000B
+    if value <= 0 or value > 1000:
+        return None
+    return value
 
-    if size_gb <= 0:
-        # No size data — cannot estimate
-        return RAMFit.UNKNOWN, 0.0, 0.0, "Model size unknown — cannot estimate RAM requirement."
 
-    quant = model.quantization.lower()
-    multiplier = _QUANT_RAM_MULTIPLIER.get(quant, _QUANT_RAM_MULTIPLIER["unknown"])
+def _bytes_per_param(quant: str) -> float:
+    return _BYTES_PER_PARAM.get(quant.lower(), _BYTES_PER_PARAM["unknown"])
 
-    # Model weights in RAM (quantized models load at their quantized size)
-    model_ram = size_gb * multiplier
 
-    # KV cache scales with model size
-    kv_cache = size_gb * _KV_CACHE_PER_GB_MODEL
+def _infer_size_gb_from_params(params_b: float, quant: str) -> float:
+    """Heuristic disk/weights size from params × bytes/param. Low-confidence only."""
+    return round(params_b * _bytes_per_param(quant), 2)
 
-    # Total inference requirement
-    total_required = (
-        model_ram
-        + kv_cache
-        + _ACTIVATION_OVERHEAD_GB
+
+def _kv_cache_gb(params_b: float | None, context_tokens: int = _DEFAULT_CONTEXT_TOKENS) -> float:
+    """
+    Rough KV-cache estimate.
+    Empirically ~0.05 GB per billion params at 2k context for typical decoder models;
+    scales roughly linearly with context.
+    """
+    if params_b is None or params_b <= 0:
+        return 0.25  # minimal placeholder when params unknown but size known
+    return round(params_b * 0.05 * (context_tokens / 2048.0), 2)
+
+
+def _shared_gpu_reserve(gpu_tier: GPUTier) -> float:
+    if gpu_tier in (GPUTier.INTEGRATED, GPUTier.APPLE_SILICON):
+        return _IGPU_SHARED_RESERVE_GB
+    return 0.0
+
+
+# ── RAM budget calculator ──────────────────────────────────────────────────────
+
+
+@dataclass
+class MemoryEstimate:
+    ram_fit: RAMFit
+    model_weights_gb: float
+    total_required_gb: float
+    note: str
+    confidence: Confidence
+    source: str  # "size_metadata" | "param_inference" | "none"
+    missing: list[str] = field(default_factory=list)
+
+
+def estimate_memory(model: ModelInfo, profile: SystemProfile, gpu_tier: GPUTier) -> MemoryEstimate:
+    """
+    Estimate memory requirement from available metadata.
+
+    - size_gb > 0: treat as quantized on-disk weights (do NOT re-apply quant shrink).
+    - size_gb == 0 but params known: infer a *heuristic* size for ranking/warnings only;
+      fit category remains UNKNOWN (never a confirmed FITS).
+    - neither: UNKNOWN with no numeric estimate.
+    """
+    params_b = parse_param_count_b(model)
+    missing: list[str] = []
+    if model.size_gb <= 0:
+        missing.append("disk/weight size")
+    if model.ram_required_gb <= 0:
+        missing.append("stated RAM requirement")
+    if params_b is None:
+        missing.append("parameter count")
+    if model.quantization.lower() in ("unknown",):
+        missing.append("quantization")
+
+    overhead = (
+        _ACTIVATION_OVERHEAD_GB
         + _OLLAMA_BASE_OVERHEAD_GB
         + _OS_RESERVED_GB
         + _SAFETY_HEADROOM_GB
+        + _shared_gpu_reserve(gpu_tier)
     )
 
+    # ── Path A: known size metadata ─────────────────────────────────────────
+    if model.size_gb > 0:
+        weights = model.size_gb  # already quantized GGUF/disk size ≈ weights in RAM
+        if params_b is None and model.size_gb > 0:
+            # Derive rough params for KV estimate only (Q4-ish fallback)
+            params_b = model.size_gb / _bytes_per_param(model.quantization)
+        kv = _kv_cache_gb(params_b)
+        total = weights + kv + overhead
+        note = (
+            f"weights ~{weights:.1f} GB (from size metadata) "
+            f"+ KV cache ~{kv:.1f} GB (@{_DEFAULT_CONTEXT_TOKENS} ctx) "
+            f"+ overhead/safety ~{overhead:.1f} GB "
+            f"= ~{total:.1f} GB total"
+        )
+        fit = _classify_fit(total, profile)
+        return MemoryEstimate(
+            ram_fit=fit,
+            model_weights_gb=weights,
+            total_required_gb=round(total, 2),
+            note=note,
+            confidence=Confidence.MEDIUM if model.quantization.lower() != "unknown" else Confidence.LOW,
+            source="size_metadata",
+            missing=missing,
+        )
+
+    # ── Path B: size unknown, params known — infer for ranking, keep UNKNOWN ─
+    if params_b is not None:
+        inferred_weights = _infer_size_gb_from_params(params_b, model.quantization)
+        kv = _kv_cache_gb(params_b)
+        total = inferred_weights + kv + overhead
+        note = (
+            f"size metadata missing; inferred weights ~{inferred_weights:.1f} GB "
+            f"from ~{params_b:g}B params × {model.quantization} heuristic "
+            f"+ KV ~{kv:.1f} GB + overhead ~{overhead:.1f} GB "
+            f"≈ ~{total:.1f} GB (UNVERIFIED — not a confirmed requirement)"
+        )
+        return MemoryEstimate(
+            ram_fit=RAMFit.UNKNOWN,
+            model_weights_gb=inferred_weights,
+            total_required_gb=round(total, 2),
+            note=note,
+            confidence=Confidence.LOW,
+            source="param_inference",
+            missing=missing,
+        )
+
+    # ── Path C: nothing usable ──────────────────────────────────────────────
+    return MemoryEstimate(
+        ram_fit=RAMFit.UNKNOWN,
+        model_weights_gb=0.0,
+        total_required_gb=0.0,
+        note="Model size and parameter count unknown — cannot estimate RAM requirement.",
+        confidence=Confidence.UNKNOWN,
+        source="none",
+        missing=missing or ["disk/weight size", "parameter count"],
+    )
+
+
+def _classify_fit(total_required: float, profile: SystemProfile) -> RAMFit:
+    """Map required GB onto FITS / TIGHT / RISKY / DOES_NOT_FIT using total vs available RAM."""
     total_ram = profile.ram.total_gb
     avail_ram = profile.ram.available_gb
 
-    note = (
-        f"model weights ~{model_ram:.1f} GB "
-        f"+ KV cache ~{kv_cache:.1f} GB "
-        f"+ overhead ~{_ACTIVATION_OVERHEAD_GB + _OLLAMA_BASE_OVERHEAD_GB:.1f} GB "
-        f"+ OS/safety ~{_OS_RESERVED_GB + _SAFETY_HEADROOM_GB:.1f} GB "
-        f"= ~{total_required:.1f} GB total"
-    )
-
     if total_required <= avail_ram:
-        return RAMFit.FIT, model_ram, total_required, note
-    elif total_required <= avail_ram * 1.25:
-        return RAMFit.TIGHT, model_ram, total_required, note
-    elif total_required <= total_ram * 0.90:
-        # Fits in total RAM but not in currently available — might work with page-out
-        return RAMFit.RISKY, model_ram, total_required, note
-    else:
-        return RAMFit.OVER, model_ram, total_required, note
+        return RAMFit.FITS
+    if total_required <= avail_ram * 1.25:
+        return RAMFit.TIGHT
+    if total_required <= total_ram * 0.90:
+        # Fits in installed RAM but not currently free — may work after freeing memory
+        return RAMFit.RISKY
+    return RAMFit.OVER
+
+
+def _ram_budget(model: ModelInfo, profile: SystemProfile) -> tuple[RAMFit, float, float, str]:
+    """Legacy tuple API used by existing tests."""
+    gpu_tier, _ = _classify_gpu(profile.gpus, profile.os_name, profile.os_arch)
+    est = estimate_memory(model, profile, gpu_tier)
+    return est.ram_fit, est.model_weights_gb, est.total_required_gb, est.note
 
 
 # ── GPU tier classifier ────────────────────────────────────────────────────────
@@ -144,12 +288,9 @@ def _classify_gpu(gpus: list[GPUDevice], os_name: str, os_arch: str) -> tuple[GP
     if not gpus:
         return GPUTier.NONE, 0.0
 
-    # Apple Silicon detection — architecture is arm64 + Darwin.
     is_apple_silicon = os_name == "Darwin" and "arm" in os_arch.lower()
 
     # Explicit GPU metadata should win over the host-platform heuristic.
-    # A simulated Intel Iris iGPU on ARM macOS must not be reclassified as
-    # Apple Silicon, and must not be rewarded with GPU acceleration.
     for gpu in gpus:
         name_lower = gpu.name.lower()
         if gpu.is_integrated:
@@ -158,18 +299,14 @@ def _classify_gpu(gpus: list[GPUDevice], os_name: str, os_arch: str) -> tuple[GP
                 return GPUTier.INTEGRATED, 0.0
 
     if is_apple_silicon:
-        # Unified memory — the whole RAM pool is usable via Metal.
-        # We report 0.0 dedicated VRAM but the tier enables GPU scoring.
         return GPUTier.APPLE_SILICON, 0.0
 
-    # Check for discrete NVIDIA / AMD
     for gpu in gpus:
         if gpu.cuda_version and gpu.vram_gb and gpu.vram_gb > 0:
             return GPUTier.DISCRETE_CUDA, gpu.vram_gb
         if gpu.rocm_version and gpu.vram_gb and gpu.vram_gb > 0:
             return GPUTier.DISCRETE_ROCM, gpu.vram_gb
 
-    # Integrated GPU detection — Intel/AMD iGPU keywords
     _INTEGRATED_KEYWORDS = (
         "iris",
         "uhd",
@@ -191,21 +328,32 @@ def _classify_gpu(gpus: list[GPUDevice], os_name: str, os_arch: str) -> tuple[GP
         name_lower = gpu.name.lower()
         if any(kw in name_lower for kw in _INTEGRATED_KEYWORDS):
             return GPUTier.INTEGRATED, 0.0
-        # macOS Intel GPU — Metal is available but it's an iGPU
         if gpu.metal_support and (gpu.vram_gb is None or gpu.vram_gb == 0.0):
             return GPUTier.INTEGRATED, 0.0
 
-    # Unknown GPU with no VRAM info — treat as integrated
     for gpu in gpus:
         if gpu.vram_gb is None or gpu.vram_gb == 0.0:
             return GPUTier.INTEGRATED, 0.0
 
-    # Discrete but unknown backend
     best_vram = max((g.vram_gb or 0.0) for g in gpus)
     return (
         GPUTier.INTEGRATED if best_vram == 0 else GPUTier.DISCRETE_CUDA,
         best_vram,
     )
+
+
+def acceleration_for_tier(gpu_tier: GPUTier) -> AccelerationStatus:
+    """Map detection tier → whether LLM acceleration is actually established."""
+    if gpu_tier == GPUTier.APPLE_SILICON:
+        return AccelerationStatus.METAL_APPLE
+    if gpu_tier == GPUTier.DISCRETE_CUDA:
+        return AccelerationStatus.CUDA
+    if gpu_tier == GPUTier.DISCRETE_ROCM:
+        return AccelerationStatus.ROCM
+    if gpu_tier == GPUTier.INTEGRATED:
+        # Detected iGPU ≠ confirmed Ollama/llama.cpp acceleration
+        return AccelerationStatus.UNVERIFIED
+    return AccelerationStatus.CPU_ONLY
 
 
 # ── Token speed estimator ──────────────────────────────────────────────────────
@@ -216,28 +364,18 @@ def _estimate_tokens_per_sec(
     profile: SystemProfile,
     gpu_tier: GPUTier,
     ram_fit: RAMFit,
-) -> tuple[float, Confidence]:
-    """
-    Rough token/sec estimate based on CPU speed, model size, and RAM fit.
-    Returns (tokens_per_sec, confidence).
-
-    Formula grounded in llama.cpp benchmarks on similar hardware:
-      - Intel i5-8257U (4C/8T, 1.4 GHz base, ~3.8 GHz boost) with AVX2
-      - ~8-12 tok/s for 3B Q4, ~4-6 tok/s for 7B Q4 (CPU only)
-      - Integrated GPU (Metal on Intel) gives very marginal speedup for llama models
-    """
-    if model.size_gb <= 0:
-        return 0.0, Confidence.UNKNOWN
-
+    params_b: float | None,
+    effective_size_gb: float,
+) -> tuple[float, Confidence, PerformanceBasis]:
     if ram_fit == RAMFit.OVER:
-        return 0.0, Confidence.HIGH  # won't run at all
+        return 0.0, Confidence.HIGH, PerformanceBasis.ESTIMATED
 
-    # Baseline: tokens/sec for a 1B parameter Q4_K_M model on this CPU
-    # Derived from: clock speed × cores × AVX2 throughput factor
+    if effective_size_gb <= 0 and params_b is None:
+        return 0.0, Confidence.UNKNOWN, PerformanceBasis.UNKNOWN
+
     freq_ghz = max(profile.cpu.frequency_max_mhz / 1000.0, 1.0) if profile.cpu.frequency_max_mhz > 0 else 2.0
     cores = profile.cpu.cores_physical or 4
 
-    # Base throughput in "compute units" — empirically calibrated
     if profile.cpu.supports_avx2:
         avx_factor = 1.0
     elif profile.cpu.supports_avx:
@@ -245,50 +383,49 @@ def _estimate_tokens_per_sec(
     else:
         avx_factor = 0.4
 
-    cpu_base = freq_ghz * min(cores, 8) * avx_factor * 2.5  # tok/s for 1B Q4
+    cpu_base = freq_ghz * min(cores, 8) * avx_factor * 2.5  # tok/s for ~1B Q4
 
-    # Adjust for model size (larger models are slower)
-    # Approximate: tok/s ∝ 1 / (param_count)^0.9
-    # Derive approximate param count from size_gb at Q4 (~0.5 bytes/param)
-    approx_params_b = model.size_gb / 0.5  # billions
-    if approx_params_b <= 0:
-        approx_params_b = 7.0  # default assumption
+    if params_b and params_b > 0:
+        approx_params_b = params_b
+        basis = PerformanceBasis.INFERRED if effective_size_gb <= 0 else PerformanceBasis.ESTIMATED
+    else:
+        approx_params_b = max(effective_size_gb / 0.55, 0.5)
+        basis = PerformanceBasis.ESTIMATED
 
     size_penalty = max(0.05, 1.0 / (approx_params_b**0.85))
     base_tps = cpu_base * size_penalty
 
-    # RAM pressure penalty
     if ram_fit == RAMFit.RISKY:
-        base_tps *= 0.40  # heavy paging
+        base_tps *= 0.40
     elif ram_fit == RAMFit.TIGHT:
-        base_tps *= 0.75  # some pressure
+        base_tps *= 0.75
+    elif ram_fit == RAMFit.UNKNOWN:
+        base_tps *= 0.85  # uncertain — don't over-claim speed
 
-    # GPU tier adjustments
-    if gpu_tier == GPUTier.APPLE_SILICON:
-        # Metal on Apple Silicon is significant — ~3-5x vs CPU
+    accel = acceleration_for_tier(gpu_tier)
+    if accel == AccelerationStatus.METAL_APPLE:
         base_tps *= 3.5
         confidence = Confidence.MEDIUM
-    elif gpu_tier in (GPUTier.DISCRETE_CUDA, GPUTier.DISCRETE_ROCM):
+    elif accel in (AccelerationStatus.CUDA, AccelerationStatus.ROCM):
         base_tps *= 8.0
         confidence = Confidence.MEDIUM
-    elif gpu_tier == GPUTier.INTEGRATED:
-        # Intel/AMD iGPU with Metal/Vulkan: marginal gain for most models
-        # llama.cpp with Metal on Intel Iris: ~10-20% speedup at best
-        base_tps *= 1.10
+    elif accel == AccelerationStatus.UNVERIFIED:
+        # Detected iGPU — score as CPU-only; do not claim acceleration speedup
         confidence = Confidence.LOW
+        basis = PerformanceBasis.INFERRED if basis == PerformanceBasis.UNKNOWN else basis
     else:
         confidence = Confidence.LOW
 
-    # Quantization speedup
     quant = model.quantization.lower()
-    if quant in ("q4_k_m", "q4_0", "q4_k_s"):
-        pass  # baseline
-    elif quant in ("q8_0", "f16", "f32"):
-        base_tps *= 0.55  # heavier
-    elif quant in ("q2_k", "q3_k_m"):
-        base_tps *= 1.20  # lighter but lower quality
+    if quant in ("q8_0", "f16", "f32", "bf16"):
+        base_tps *= 0.55
+    elif quant in ("q2_k", "q3_k_m", "q3_k_s"):
+        base_tps *= 1.20
 
-    return round(base_tps, 1), confidence
+    if ram_fit == RAMFit.UNKNOWN and params_b is None:
+        return 0.0, Confidence.UNKNOWN, PerformanceBasis.UNKNOWN
+
+    return round(base_tps, 1), confidence, basis
 
 
 # ── Main scoring function ──────────────────────────────────────────────────────
@@ -297,25 +434,37 @@ def _estimate_tokens_per_sec(
 @dataclass
 class ScoredModel:
     model: ModelInfo
-    score: float  # 0..100 — composite score
-    ram_fit: RAMFit  # FIT / TIGHT / RISKY / OVER / UNKNOWN
+    score: float  # 0..100 — composite ranking score
+    ram_fit: RAMFit
     fits_vram: bool
     fits_disk: bool
     gpu_tier: GPUTier
     will_use_gpu: bool
-    estimated_tps: float  # tokens per second (0 = unknown)
+    estimated_tps: float
     tps_confidence: Confidence
-    estimated_total_ram_gb: float  # total RAM this model needs
-    ram_budget_note: str  # human-readable calculation
-    confidence: Confidence  # overall recommendation confidence
+    estimated_total_ram_gb: float
+    ram_budget_note: str
+    confidence: Confidence
     explanation: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
-    disqualified: bool = False  # True = hardware cannot run this model
+    disqualified: bool = False
 
-    # Legacy compat
+    # Separated concerns
+    installable: bool = True
+    runtime_compatible: bool = True
+    acceleration: AccelerationStatus = AccelerationStatus.CPU_ONLY
+    gpu_detected: bool = False
+    performance_basis: PerformanceBasis = PerformanceBasis.UNKNOWN
+    verified: bool = False  # True only when size metadata supports a real fit assessment
+    unverified: bool = True
+    missing_metadata: list[str] = field(default_factory=list)
+    params_b: float | None = None
+    memory_confidence: Confidence = Confidence.UNKNOWN
+    rank_reason: str = ""
+
     @property
     def fits_ram(self) -> bool:
-        return self.ram_fit in (RAMFit.FIT, RAMFit.TIGHT)
+        return self.ram_fit in (RAMFit.FITS, RAMFit.TIGHT)
 
     @property
     def estimated_speed(self) -> str:
@@ -329,92 +478,180 @@ class ScoredModel:
             return "slow"
         return "very slow"
 
+    @property
+    def is_safe_install_default(self) -> bool:
+        """
+        Verified FITS/TIGHT — preferred default install (no override needed).
+        """
+        return (
+            self.installable and self.verified and not self.disqualified and self.ram_fit in (RAMFit.FITS, RAMFit.TIGHT)
+        )
+
+    @property
+    def is_acceptable_install_candidate(self) -> bool:
+        """
+        Verified and not OVER/disqualified. Includes RISKY — still preferable to UNVERIFIED.
+        """
+        return (
+            self.installable
+            and self.verified
+            and not self.disqualified
+            and self.ram_fit in (RAMFit.FITS, RAMFit.TIGHT, RAMFit.RISKY)
+        )
+
 
 def score_model(model: ModelInfo, profile: SystemProfile) -> ScoredModel:
-    """
-    Two-layer evaluation:
-      Layer 1 — Hardware Compatibility Gate
-      Layer 2 — Quality/Usefulness Score
-    """
+    """Evaluate one model against a hardware profile."""
     disk_free = profile.disk.free_gb if profile.disk else 999.0
     gpu_tier, usable_vram = _classify_gpu(profile.gpus, profile.os_name, profile.os_arch)
+    accel = acceleration_for_tier(gpu_tier)
+    gpu_detected = bool(profile.gpus)
+    params_b = parse_param_count_b(model)
 
     explanation: list[str] = []
     warnings: list[str] = []
     score = 50.0
     disqualified = False
 
-    # ── Layer 1A: Disk ────────────────────────────────────────────────────────
-    fits_disk = (disk_free >= model.size_gb * 1.1) if model.size_gb > 0 else True
-    if not fits_disk:
-        warnings.append(
-            f"Disk: only {disk_free:.1f} GB free, model requires ~{model.size_gb:.1f} GB — cannot download."
-        )
-        disqualified = True
-        score -= 40
+    mem = estimate_memory(model, profile, gpu_tier)
+    ram_fit = mem.ram_fit
+    total_req_gb = mem.total_required_gb
+    ram_note = mem.note
+    missing = list(mem.missing)
+    verified = mem.source == "size_metadata"
+    unverified = not verified
 
-    # ── Layer 1B: RAM budget ──────────────────────────────────────────────────
-    ram_fit, _model_ram_gb, total_req_gb, ram_note = _ram_budget(model, profile)
+    # Effective size for disk / speed: prefer real metadata, else inferred heuristic
+    effective_size = model.size_gb if model.size_gb > 0 else mem.model_weights_gb
 
+    # ── Installability ──────────────────────────────────────────────────────
+    installable = bool(model.ollama_pullable)
+    if installable:
+        score += 4
+        explanation.append("Installable with `ollama pull` (pullable ≠ guaranteed fit).")
+    else:
+        score -= 20
+        warnings.append("HuggingFace-only — cannot install via `ollama pull`.")
+
+    # ── Runtime compatibility (conservative: Ollama GGUF runs on CPU everywhere) ─
+    runtime_compatible = True
+    explanation.append("Runtime: treated as CPU-capable via Ollama/llama.cpp-class backends.")
+
+    # ── Disk ────────────────────────────────────────────────────────────────
+    if model.size_gb > 0:
+        fits_disk = disk_free >= model.size_gb * 1.1
+        if not fits_disk:
+            warnings.append(
+                f"Disk: only {disk_free:.1f} GB free, model requires ~{model.size_gb:.1f} GB — cannot download."
+            )
+            disqualified = True
+            score -= 40
+        else:
+            explanation.append(f"Disk: {disk_free:.1f} GB free — fits download ({model.size_gb:.1f} GB).")
+    else:
+        # Unknown size — do not claim disk fit; soft-check inferred size if any
+        fits_disk = True
+        if effective_size > 0 and disk_free < effective_size * 1.1:
+            warnings.append(
+                f"Disk: {disk_free:.1f} GB free may be insufficient for inferred ~{effective_size:.1f} GB download."
+            )
+            score -= 10
+
+    # ── Memory fit ──────────────────────────────────────────────────────────
     if ram_fit == RAMFit.UNKNOWN:
-        # Unknown size — penalise, do NOT treat as compatible
-        score -= 15
-        warnings.append("Model size unknown — RAM compatibility cannot be verified. This model is deprioritised.")
-    elif ram_fit == RAMFit.FIT:
+        score -= 20
+        warnings.append(
+            "UNVERIFIED: size/RAM metadata incomplete — "
+            + (", ".join(missing) if missing else "key fields missing")
+            + ". Not a confirmed fit."
+        )
+        if mem.source == "param_inference" and total_req_gb > 0:
+            explanation.append(
+                f"Param-based heuristic suggests ~{total_req_gb:.1f} GB may be needed "
+                f"({profile.ram.available_gb:.1f} GB available / {profile.ram.total_gb:.1f} GB total) "
+                f"— confidence {mem.confidence.value}."
+            )
+            # Rank using heuristic pressure without promoting to FITS
+            if total_req_gb > profile.ram.total_gb:
+                score -= 35
+                warnings.append(
+                    f"Inferred requirement (~{total_req_gb:.1f} GB) exceeds installed RAM "
+                    f"({profile.ram.total_gb:.1f} GB) — likely DOES_NOT_FIT if size were known."
+                )
+            elif total_req_gb > profile.ram.available_gb:
+                score -= 18
+                warnings.append(
+                    f"Inferred requirement (~{total_req_gb:.1f} GB) exceeds currently available RAM "
+                    f"({profile.ram.available_gb:.1f} GB)."
+                )
+            else:
+                score -= 5  # still unverified even if heuristic looks OK
+        else:
+            score -= 10  # no params either — near-useless for ranking
+    elif ram_fit == RAMFit.FITS:
         headroom = profile.ram.available_gb - total_req_gb
-        score += min(25, headroom * 6)
+        score += min(28, 8 + headroom * 5)
         explanation.append(
             f"RAM: estimated {total_req_gb:.1f} GB needed, "
-            f"{profile.ram.available_gb:.1f} GB available — fits comfortably "
-            f"({headroom:.1f} GB headroom)."
+            f"{profile.ram.available_gb:.1f} GB available / {profile.ram.total_gb:.1f} GB total — "
+            f"FITS ({headroom:.1f} GB headroom). Confidence: {mem.confidence.value}."
         )
     elif ram_fit == RAMFit.TIGHT:
-        score += 5
+        score += 6
         explanation.append(
-            f"RAM: estimated {total_req_gb:.1f} GB needed, {profile.ram.available_gb:.1f} GB available — tight fit."
+            f"RAM: estimated {total_req_gb:.1f} GB needed, {profile.ram.available_gb:.1f} GB available — TIGHT fit."
         )
         warnings.append("May be slow or unstable under memory pressure.")
     elif ram_fit == RAMFit.RISKY:
-        score -= 15
+        score -= 12
         warnings.append(
             f"RAM: estimated {total_req_gb:.1f} GB needed but only "
             f"{profile.ram.available_gb:.1f} GB currently free "
-            f"({profile.ram.total_gb:.1f} GB total). "
-            "May require closing other apps — expect paging/swapping."
+            f"({profile.ram.total_gb:.1f} GB total). RISKY — expect paging."
         )
     elif ram_fit == RAMFit.OVER:
         score -= 45
         disqualified = True
         warnings.append(
-            f"RAM: estimated {total_req_gb:.1f} GB needed, only {profile.ram.total_gb:.1f} GB installed — WILL NOT FIT."
+            f"RAM: estimated {total_req_gb:.1f} GB needed, only {profile.ram.total_gb:.1f} GB installed — DOES_NOT_FIT."
         )
 
-    # ── Layer 1C: GPU tier / acceleration reality check ───────────────────────
+    # Prefer better utilisation among verified fits (capability vs safety)
+    if verified and ram_fit in (RAMFit.FITS, RAMFit.TIGHT) and total_req_gb > 0:
+        utilisation = total_req_gb / max(profile.ram.total_gb, 1.0)
+        if 0.35 <= utilisation <= 0.70:
+            score += 10
+            explanation.append(
+                f"RAM utilisation ~{utilisation * 100:.0f}% of installed — capable without exhausting the machine."
+            )
+        elif utilisation < 0.20:
+            score += 3
+            explanation.append("Small footprint — safe but limited capability on this hardware.")
+
+    # ── Acceleration (detection ≠ usable LLM accel) ─────────────────────────
     fits_vram = False
     will_use_gpu = False
 
     if gpu_tier == GPUTier.NONE:
-        explanation.append("No GPU detected — CPU-only inference.")
-        score -= 3
-
+        explanation.append("GPU detected: no. LLM acceleration: CPU-only. Scoring assumes CPU inference.")
+        score -= 2
     elif gpu_tier == GPUTier.INTEGRATED:
-        # Intel Iris / AMD Vega iGPU: Metal/Vulkan available but iGPU
-        # shares system RAM. No dedicated VRAM. Marginal speedup only.
-        will_use_gpu = False
-        fits_vram = True  # no dedicated VRAM requirement
-        warnings.append(
-            f"GPU detected ({profile.gpus[0].name if profile.gpus else 'iGPU'}) "
-            "but it is an integrated GPU sharing system RAM. "
-            "GPU acceleration is unverified — treating as CPU-only for scoring."
+        gpu_name = profile.gpus[0].name if profile.gpus else "integrated GPU"
+        explanation.append(
+            f"GPU detected: yes ({gpu_name}) — integrated, shared system memory. "
+            "LLM acceleration: unverified/backend-dependent. Scoring: CPU-only."
         )
-        score -= 3  # same penalty as no GPU
-
+        warnings.append("Detecting an integrated GPU does not prove Ollama can accelerate on it.")
+        score -= 2
+        fits_vram = True  # no discrete VRAM gate
     elif gpu_tier == GPUTier.APPLE_SILICON:
         will_use_gpu = True
         fits_vram = True
         score += 15
-        explanation.append("Apple Silicon with Metal — unified memory allows full GPU acceleration.")
-
+        explanation.append(
+            "GPU detected: yes (Apple Silicon). LLM acceleration: Metal (established). "
+            "Scoring includes GPU acceleration."
+        )
     elif gpu_tier in (GPUTier.DISCRETE_CUDA, GPUTier.DISCRETE_ROCM):
         backend = "CUDA" if gpu_tier == GPUTier.DISCRETE_CUDA else "ROCm"
         if model.vram_required_gb > 0 and usable_vram >= model.vram_required_gb:
@@ -422,37 +659,37 @@ def score_model(model: ModelInfo, profile: SystemProfile) -> ScoredModel:
             will_use_gpu = True
             score += min(25, (usable_vram - model.vram_required_gb) * 3)
             explanation.append(
-                f"{backend}: {usable_vram:.1f} GB VRAM ≥ "
-                f"{model.vram_required_gb:.1f} GB required — full GPU acceleration."
+                f"GPU detected: yes. LLM acceleration: {backend} "
+                f"({usable_vram:.1f} GB VRAM ≥ {model.vram_required_gb:.1f} GB required)."
             )
-        elif model.vram_required_gb == 0 and model.size_gb > 0:
-            # We don't know exact VRAM requirement — estimate from model size
-            if usable_vram >= model.size_gb * 0.9:
+        elif model.vram_required_gb == 0 and effective_size > 0:
+            if usable_vram >= effective_size * 0.9:
                 fits_vram = True
                 will_use_gpu = True
                 score += 15
                 explanation.append(
-                    f"{backend}: {usable_vram:.1f} GB VRAM — likely fits model ({model.size_gb:.1f} GB)."
+                    f"GPU detected: yes. LLM acceleration: {backend} likely "
+                    f"({usable_vram:.1f} GB VRAM vs ~{effective_size:.1f} GB weights)."
                 )
             else:
                 fits_vram = False
                 will_use_gpu = False
                 warnings.append(
                     f"{backend}: {usable_vram:.1f} GB VRAM may be insufficient "
-                    f"for {model.size_gb:.1f} GB model — partial CPU offload."
+                    f"for ~{effective_size:.1f} GB weights — expect CPU offload."
                 )
                 score += 5
         else:
             fits_vram = True
             will_use_gpu = True
             score += 10
-            explanation.append(f"{backend}: GPU available — acceleration enabled.")
+            explanation.append(f"GPU detected: yes. LLM acceleration: {backend} available.")
 
-    # ── Layer 2A: CPU instruction sets ───────────────────────────────────────
+    # ── CPU instruction sets ────────────────────────────────────────────────
     cpu = profile.cpu
     if cpu.supports_avx2:
         score += 6
-        explanation.append("AVX2 supported — optimized quantized inference.")
+        explanation.append("AVX2 supported — optimized quantized CPU inference.")
     elif cpu.supports_avx:
         score += 3
         explanation.append("AVX supported (no AVX2) — basic SIMD acceleration.")
@@ -460,100 +697,94 @@ def score_model(model: ModelInfo, profile: SystemProfile) -> ScoredModel:
         score -= 8
         warnings.append("No AVX support — inference will be very slow.")
 
-    # ── Layer 2B: Model size vs available hardware ────────────────────────────
-    if model.size_gb > 0:
-        if fits_disk:
-            explanation.append(f"Disk: {disk_free:.1f} GB free — fits model ({model.size_gb:.1f} GB).")
-        # Give a bonus proportional to how WELL it fits (not just that it fits)
-        # Larger models that still fit score slightly better than tiny ones
-        if ram_fit in (RAMFit.FIT, RAMFit.TIGHT):
-            # Prefer models that use a healthy fraction of available RAM
-            # (too small = underutilising hardware; too large = risky)
-            utilisation = total_req_gb / max(profile.ram.total_gb, 1.0)
-            if 0.40 <= utilisation <= 0.75:
-                score += 8
-                explanation.append(
-                    f"Good RAM utilisation ({utilisation * 100:.0f}% of total) — "
-                    "large enough to be capable, small enough to be safe."
-                )
-            elif utilisation < 0.25:
-                score += 2  # very small model — runs but may lack capability
-
-    # ── Layer 2C: Quantization quality ───────────────────────────────────────
+    # ── Quantization (avoid unsupported marketing claims) ───────────────────
     quant = model.quantization.lower()
     if quant in ("q4_k_m", "q4_k_s"):
-        score += 8
-        explanation.append(f"{model.quantization} — best quality/speed balance.")
+        score += 5
+        explanation.append(f"{model.quantization} — commonly used 4-bit GGUF quant.")
     elif quant == "q5_k_m":
-        score += 7
-        explanation.append(f"{model.quantization} — high quality, moderate size.")
+        score += 4
+        explanation.append(f"{model.quantization} — higher-bit quant; larger footprint.")
     elif quant == "q8_0":
         if profile.ram.total_gb >= 16:
-            score += 5
-            explanation.append(f"{model.quantization} — near-lossless, hardware can handle it.")
+            score += 3
+            explanation.append(f"{model.quantization} — near-lossless; needs more RAM.")
         else:
             score -= 5
-            warnings.append(f"{model.quantization} — high quality but heavy; tight on 8 GB.")
+            warnings.append(f"{model.quantization} — heavy for ≤8 GB systems.")
     elif quant in ("q2_k", "q3_k_m", "q3_k_s"):
-        score += 2
-        warnings.append(f"{model.quantization} — very compressed; quality trade-offs expected.")
+        score += 1
+        warnings.append(f"{model.quantization} — aggressive compression; quality trade-offs likely.")
     elif quant == "unknown":
-        score -= 5
-        warnings.append("Quantization unknown — quality and speed cannot be assessed.")
+        score -= 6
+        warnings.append("Quantization unknown — quality and memory density cannot be assessed.")
 
-    # ── Layer 2D: Token speed estimate ───────────────────────────────────────
-    est_tps, tps_conf = _estimate_tokens_per_sec(model, profile, gpu_tier, ram_fit)
-
+    # ── Speed estimate ──────────────────────────────────────────────────────
+    est_tps, tps_conf, perf_basis = _estimate_tokens_per_sec(
+        model, profile, gpu_tier, ram_fit, params_b, effective_size
+    )
     if est_tps > 0:
-        # Reward for usable speed
         if est_tps >= 8:
-            score += 10
+            score += 8
         elif est_tps >= 4:
-            score += 6
+            score += 5
         elif est_tps >= 2:
             score += 2
         else:
             score -= 5
-            warnings.append(f"Estimated speed ~{est_tps:.1f} tok/s — may feel slow for interactive use.")
+            warnings.append(f"Estimated speed ~{est_tps:.1f} tok/s ({perf_basis.value}) — may feel slow interactively.")
+        explanation.append(
+            f"Performance {perf_basis.value}: ~{est_tps:.1f} tok/s "
+            f"(confidence {tps_conf.value}); not a measured benchmark."
+        )
+    else:
+        warnings.append("Performance: unknown — insufficient metadata for a speed estimate.")
 
-    # ── Layer 2E: Known issues ────────────────────────────────────────────────
+    # ── Known issues / popularity (weak signals) ────────────────────────────
     if model.known_issues:
         score -= len(model.known_issues) * 3
         warnings.append(f"{len(model.known_issues)} open community bug report(s).")
 
-    # ── Layer 2F: Popularity ──────────────────────────────────────────────────
     if model.ollama_pull_count > 1_000_000:
-        score += 5
-        explanation.append("Very popular (1M+ pulls) — well-tested in production.")
+        score += 3
+        explanation.append("High pull count (1M+) — widely exercised, not a fit guarantee.")
     elif model.ollama_pull_count > 100_000:
-        score += 2
+        score += 1
 
-    # ── Layer 2G: Installability ──────────────────────────────────────────────
-    if not model.ollama_pullable:
-        score -= 25
-        warnings.append("HuggingFace-only — cannot install via `ollama pull`. Manual download required.")
-    else:
-        score += 5
-        explanation.append("Installable with `ollama pull`.")
+    # Param-scale differentiation among otherwise-tied unknowns
+    if params_b is not None:
+        # Mild preference for sizes that match the machine class
+        target = max(profile.ram.total_gb * 0.4, 1.0)  # rough "sweet" param-GB proxy
+        # distance of inferred weight size from a comfortable share of RAM
+        if mem.model_weights_gb > 0:
+            delta = abs(mem.model_weights_gb - target)
+            score += max(0.0, 6.0 - delta)
 
-    # ── Overall confidence ────────────────────────────────────────────────────
-    data_gaps = sum(
-        [
-            model.size_gb == 0,
-            model.quantization == "unknown",
-            model.ram_required_gb == 0,
-        ]
-    )
+    # ── Overall confidence ──────────────────────────────────────────────────
     if disqualified:
-        confidence = Confidence.HIGH  # highly confident it won't work
-    elif data_gaps == 0 and ram_fit in (RAMFit.FIT, RAMFit.TIGHT):
+        # Highly confident the model will not run on this hardware
         confidence = Confidence.HIGH
-    elif data_gaps <= 1:
+    elif verified and ram_fit in (RAMFit.FITS, RAMFit.TIGHT) and not missing:
+        confidence = Confidence.HIGH
+    elif verified:
         confidence = Confidence.MEDIUM
-    else:
+    elif mem.source == "param_inference":
         confidence = Confidence.LOW
+    else:
+        confidence = Confidence.UNKNOWN
 
     score = max(0.0, min(100.0, round(score, 1)))
+
+    rank_reason = _build_rank_reason(
+        ram_fit=ram_fit,
+        verified=verified,
+        score=score,
+        total_req_gb=total_req_gb,
+        params_b=params_b,
+        accel=accel,
+        perf_basis=perf_basis,
+        missing=missing,
+    )
 
     return ScoredModel(
         model=model,
@@ -571,7 +802,63 @@ def score_model(model: ModelInfo, profile: SystemProfile) -> ScoredModel:
         explanation=explanation,
         warnings=warnings,
         disqualified=disqualified,
+        installable=installable,
+        runtime_compatible=runtime_compatible,
+        acceleration=accel,
+        gpu_detected=gpu_detected,
+        performance_basis=perf_basis,
+        verified=verified,
+        unverified=unverified,
+        missing_metadata=missing,
+        params_b=params_b,
+        memory_confidence=mem.confidence,
+        rank_reason=rank_reason,
     )
+
+
+def _build_rank_reason(
+    *,
+    ram_fit: RAMFit,
+    verified: bool,
+    score: float,
+    total_req_gb: float,
+    params_b: float | None,
+    accel: AccelerationStatus,
+    perf_basis: PerformanceBasis,
+    missing: list[str],
+) -> str:
+    parts = [f"Score {score:.0f}/100"]
+    if not verified:
+        parts.append("UNVERIFIED (incomplete size/RAM metadata)")
+        if missing:
+            parts.append("missing: " + ", ".join(missing))
+    else:
+        parts.append(f"memory fit {ram_fit.value}")
+        if total_req_gb > 0:
+            parts.append(f"est. ~{total_req_gb:.1f} GB RAM")
+    if params_b is not None:
+        parts.append(f"~{params_b:g}B params")
+    parts.append(f"accel={accel.value}")
+    parts.append(f"perf={perf_basis.value}")
+    return "; ".join(parts)
+
+
+def _sort_key(sm: ScoredModel) -> tuple:
+    """
+    Sort key for recommendations.
+    Verified FITS/TIGHT first; UNKNOWN/RISKY never win ties over verified fits;
+    disqualified last. Final score breaks remaining ties.
+    """
+    if sm.disqualified or sm.ram_fit == RAMFit.OVER:
+        tier = 3
+    elif sm.verified and sm.ram_fit in (RAMFit.FITS, RAMFit.TIGHT):
+        tier = 0
+    elif sm.verified and sm.ram_fit == RAMFit.RISKY:
+        tier = 1
+    else:
+        # UNKNOWN / unverified
+        tier = 2
+    return (tier, -sm.score, sm.estimated_total_ram_gb or 1e9)
 
 
 def rank_models(
@@ -580,21 +867,94 @@ def rank_models(
     top_n: int = 10,
     category_filter: str | None = None,
 ) -> list[ScoredModel]:
-    """
-    Score and rank all models.
-    Disqualified models (hardware can't run them) are pushed to the end.
-    """
+    """Score and rank models using final compatibility + ranking results."""
     if category_filter:
         models = [m for m in models if category_filter in m.categories]
 
     disk_free = profile.disk.free_gb if profile.disk else 999.0
-    # Hard pre-filter: only models that can physically download
     candidates = [m for m in models if m.size_gb == 0 or m.size_gb <= disk_free * 0.95]
 
     logger.info("Scoring %d models (%d pre-filtered by disk)", len(candidates), len(models))
 
     scored = [score_model(m, profile) for m in candidates]
-
-    # Sort: non-disqualified first, then by score descending
-    scored.sort(key=lambda s: (int(s.disqualified), -s.score))
+    scored.sort(key=_sort_key)
     return scored[:top_n]
+
+
+def select_install_candidate(
+    ranked: list[ScoredModel],
+) -> tuple[ScoredModel | None, ScoredModel | None, str]:
+    """
+    Choose the default install candidate.
+
+    Returns:
+        (default_candidate, override_candidate, advisory_message)
+
+    Preference:
+      1. Verified FITS/TIGHT (no override)
+      2. Verified RISKY (still preferred over UNKNOWN; warn about risk)
+      3. Otherwise no default — UNKNOWN/OVER require explicit override
+
+    Unknown-size / UNVERIFIED models are never the silent default.
+    """
+    pullable = [sm for sm in ranked if sm.installable]
+    if not pullable:
+        return None, None, "No Ollama-pullable models in the recommendation list."
+
+    top = pullable[0]
+    preferred = next((sm for sm in pullable if sm.is_safe_install_default), None)
+    if preferred is None:
+        preferred = next((sm for sm in pullable if sm.is_acceptable_install_candidate), None)
+
+    if top.is_safe_install_default:
+        return (
+            top,
+            None,
+            (
+                f"Top recommendation {top.model.full_tag} is a verified "
+                f"{top.ram_fit.value} fit — suitable as the default install."
+            ),
+        )
+
+    if preferred is not None and preferred.model.full_tag == top.model.full_tag:
+        return (
+            top,
+            None,
+            (
+                f"Top recommendation {top.model.full_tag} is verified but "
+                f"{top.ram_fit.value} — may need closing other apps. "
+                "No stronger verified FITS/TIGHT candidate ranked higher."
+            ),
+        )
+
+    reasons = []
+    if top.unverified or top.ram_fit == RAMFit.UNKNOWN:
+        reasons.append("UNVERIFIED / UNKNOWN memory fit (incomplete metadata)")
+    if top.ram_fit == RAMFit.RISKY and not top.verified:
+        reasons.append("RISKY memory fit without verified size metadata")
+    if top.ram_fit == RAMFit.OVER or top.disqualified:
+        reasons.append("DOES_NOT_FIT / incompatible")
+    reason_txt = "; ".join(reasons) or "not the preferred verified install"
+
+    if preferred is not None:
+        override = top if top.model.full_tag != preferred.model.full_tag else None
+        risk_note = ""
+        if preferred.ram_fit == RAMFit.RISKY:
+            risk_note = (
+                f" Note: even the safer pick is RISKY on current free RAM "
+                f"(needs ~{preferred.estimated_total_ram_gb:.1f} GB estimated)."
+            )
+        msg = (
+            f"Top-ranked {top.model.full_tag} is {reason_txt}. "
+            f"Safer verified alternative: {preferred.model.full_tag} "
+            f"({preferred.ram_fit.value}, score {preferred.score:.0f}/100)."
+            f"{risk_note} "
+            "Installing an unverified/high-risk model requires an explicit override."
+        )
+        return preferred, override, msg
+
+    msg = (
+        f"Top-ranked {top.model.full_tag} is {reason_txt}, and no verified "
+        f"FITS/TIGHT/RISKY alternative is available. Install only with an explicit override."
+    )
+    return None, top, msg

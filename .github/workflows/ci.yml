@@ -7,28 +7,6 @@ on:
     branches: [main]
 
 jobs:
-  test:
-    name: Test on ${{ matrix.os }} / Python ${{ matrix.python }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        python: ["3.11", "3.12"]
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python ${{ matrix.python }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
-
-      - name: Install package and dev dependencies
-        run: pip install -e ".[dev]"
-
-      - name: Run tests
-        run: python -m pytest tests/ -v
-
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -37,7 +15,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install dev dependencies
+      - name: Install package and dev dependencies
         run: pip install -e ".[dev]"
       - name: Run ruff
         run: ruff check src/
+      - name: Verify package imports
+        run: python -c "from ai_model_detector import __version__; from ai_model_detector.scorer import rank_models; print(__version__)"

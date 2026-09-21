@@ -1,16 +1,37 @@
+# Python
 __pycache__/
 *.py[cod]
+*$py.class
 *.pyo
 *.egg-info/
+*.egg
 dist/
 build/
 .eggs/
+*.whl
+
+# Virtual environments
 .venv/
 venv/
 env/
-*.egg
+
+# Tooling caches
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# Project artifacts
 *.log
 *.spx

@@ -23,10 +23,7 @@ OLLAMA_MODEL_API = "https://ollama.com/api/models"  # undocumented but returns t
 HF_API_URL = "https://huggingface.co/api/models"
 
 # Community issue trackers (Reddit / GitHub) parsed via simple JSON API
-GITHUB_ISSUES_URL = (
-    "https://api.github.com/repos/ollama/ollama/issues"
-    "?state=open&labels=bug&per_page=20"
-)
+GITHUB_ISSUES_URL = "https://api.github.com/repos/ollama/ollama/issues?state=open&labels=bug&per_page=20"
 
 REQUEST_TIMEOUT = 15
 USER_AGENT = "AI-Model-Detector/1.0 (https://github.com/eliekh05/AI-Model-Detector-Auto-Downloader)"
@@ -189,7 +186,7 @@ def _fetch_ollama_library() -> list[ModelInfo]:
         # Size pattern near each tag: look for "X.XGB" or "X.X GB" near tag refs
         # Try to extract size from the tags listing table
         size_blocks = re.findall(
-            r'([a-zA-Z0-9_.\-]+)\s*[^<]*?([\d.]+\s*(?:GB|MB))',
+            r"([a-zA-Z0-9_.\-]+)\s*[^<]*?([\d.]+\s*(?:GB|MB))",
             page_html,
         )
         size_map: dict[str, float] = {}
@@ -201,13 +198,13 @@ def _fetch_ollama_library() -> list[ModelInfo]:
         # If no tags found from href pattern, try looking for tag name spans
         if not tag_entries:
             for tm in re.finditer(
-                r'<(?:span|code|td)[^>]*>\s*([a-zA-Z0-9][a-zA-Z0-9_.\-]{0,25})\s*</(?:span|code|td)>',
+                r"<(?:span|code|td)[^>]*>\s*([a-zA-Z0-9][a-zA-Z0-9_.\-]{0,25})\s*</(?:span|code|td)>",
                 page_html,
             ):
                 candidate = tm.group(1)
                 # Filter: must look like a valid Ollama tag
                 if (
-                    re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_.\-]*$', candidate)
+                    re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_.\-]*$", candidate)
                     and candidate != slug
                     and candidate not in {t for t, _ in tag_entries}
                 ):
