@@ -15,12 +15,14 @@ console = Console()
 
 
 def print_banner() -> None:
-    console.print(Panel(
-        "[bold cyan]AI Model Detector & Auto Downloader[/]\n"
-        "[dim]Deep hardware scanning · Live model registry · Smart recommendations[/]",
-        box=box.DOUBLE_EDGE,
-        style="bold",
-    ))
+    console.print(
+        Panel(
+            "[bold cyan]AI Model Detector & Auto Downloader[/]\n"
+            "[dim]Deep hardware scanning · Live model registry · Smart recommendations[/]",
+            box=box.DOUBLE_EDGE,
+            style="bold",
+        )
+    )
 
 
 def print_system_profile(profile: SystemProfile) -> None:
@@ -35,13 +37,16 @@ def print_system_profile(profile: SystemProfile) -> None:
     table.add_row(
         "CPU Extensions",
         " ".join(
-            f for f, ok in [
+            f
+            for f, ok in [
                 ("AVX", profile.cpu.supports_avx),
                 ("AVX2", profile.cpu.supports_avx2),
                 ("AVX-512", profile.cpu.supports_avx512),
                 ("F16C", profile.cpu.supports_f16c),
-            ] if ok
-        ) or "None detected"
+            ]
+            if ok
+        )
+        or "None detected",
     )
     table.add_row("RAM Total", f"{profile.ram.total_gb:.1f} GB")
     table.add_row("RAM Available", f"{profile.ram.available_gb:.1f} GB")
@@ -50,8 +55,8 @@ def print_system_profile(profile: SystemProfile) -> None:
 
     if profile.gpus:
         for i, gpu in enumerate(profile.gpus):
-            label = f"GPU {i+1}"
-            vram  = f"{gpu.vram_gb:.1f} GB VRAM" if gpu.vram_gb else "VRAM unknown (shared)"
+            label = f"GPU {i + 1}"
+            vram = f"{gpu.vram_gb:.1f} GB VRAM" if gpu.vram_gb else "VRAM unknown (shared)"
             accel = []
             if gpu.cuda_version:
                 accel.append(f"CUDA {gpu.cuda_version}")
@@ -67,7 +72,7 @@ def print_system_profile(profile: SystemProfile) -> None:
     if profile.disk:
         table.add_row(
             "Disk Free",
-            f"{profile.disk.free_gb:.1f} GB / {profile.disk.total_gb:.1f} GB"
+            f"{profile.disk.free_gb:.1f} GB / {profile.disk.total_gb:.1f} GB",
         )
 
     ollama_status = (
@@ -83,19 +88,19 @@ def print_system_profile(profile: SystemProfile) -> None:
 
 def _ram_fit_badge(ram_fit: RAMFit) -> str:
     return {
-        RAMFit.FIT:     "[green]FIT[/]",
-        RAMFit.TIGHT:   "[yellow]TIGHT[/]",
-        RAMFit.RISKY:   "[orange3]RISKY[/]",
-        RAMFit.OVER:    "[red]DOES NOT FIT[/]",
+        RAMFit.FIT: "[green]FIT[/]",
+        RAMFit.TIGHT: "[yellow]TIGHT[/]",
+        RAMFit.RISKY: "[orange3]RISKY[/]",
+        RAMFit.OVER: "[red]DOES NOT FIT[/]",
         RAMFit.UNKNOWN: "[dim]UNKNOWN[/]",
     }[ram_fit]
 
 
 def _confidence_badge(conf: Confidence) -> str:
     return {
-        Confidence.HIGH:    "[green]High[/]",
-        Confidence.MEDIUM:  "[yellow]Medium[/]",
-        Confidence.LOW:     "[orange3]Low[/]",
+        Confidence.HIGH: "[green]High[/]",
+        Confidence.MEDIUM: "[yellow]Medium[/]",
+        Confidence.LOW: "[orange3]Low[/]",
         Confidence.UNKNOWN: "[dim]Unknown[/]",
     }[conf]
 
@@ -137,10 +142,7 @@ def print_recommendations(scored: list[ScoredModel], top: int = 5) -> None:
             border = "dim"
             fit_label = "[dim]? UNKNOWN SIZE[/]"
 
-        install_badge = (
-            "[green]● ollama pull[/]" if m.ollama_pullable
-            else "[yellow]● manual download[/]"
-        )
+        install_badge = "[green]● ollama pull[/]" if m.ollama_pullable else "[yellow]● manual download[/]"
 
         title = (
             f"[bold]#{shown}[/]  [white]{m.full_tag}[/]  "
@@ -179,9 +181,7 @@ def print_recommendations(scored: list[ScoredModel], top: int = 5) -> None:
             )
 
         # ── Overall confidence ──────────────────────────────────────────────
-        lines.append(
-            f"[dim]Overall confidence:[/] {_confidence_badge(sm.confidence)}"
-        )
+        lines.append(f"[dim]Overall confidence:[/] {_confidence_badge(sm.confidence)}")
 
         # ── Explanation bullets ─────────────────────────────────────────────
         for line in sm.explanation[:4]:
@@ -194,12 +194,14 @@ def print_recommendations(scored: list[ScoredModel], top: int = 5) -> None:
         if m.known_issues:
             lines.append(f"  [red]⚠[/]  {len(m.known_issues)} open community bug report(s)")
 
-        console.print(Panel(
-            "\n".join(lines),
-            title=title,
-            border_style=border,
-            padding=(0, 1),
-        ))
+        console.print(
+            Panel(
+                "\n".join(lines),
+                title=title,
+                border_style=border,
+                padding=(0, 1),
+            )
+        )
 
 
 def _approx_params(size_gb: float) -> str:
@@ -208,12 +210,13 @@ def _approx_params(size_gb: float) -> str:
         return "unknown"
     params_b = size_gb / 0.5
     if params_b < 1.0:
-        return f"~{params_b*1000:.0f}M"
+        return f"~{params_b * 1000:.0f}M"
     return f"~{params_b:.1f}B"
 
 
 def print_download_result(result_code, message: str) -> None:
     from .downloader import DownloadResult
+
     if result_code == DownloadResult.SUCCESS:
         console.print(f"\n[bold green]✓ {message}[/]")
     elif result_code == DownloadResult.ALREADY_EXISTS:

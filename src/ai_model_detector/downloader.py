@@ -28,11 +28,11 @@ def _clean(text: str) -> str:
 
 
 class DownloadResult(Enum):
-    SUCCESS     = "success"
+    SUCCESS = "success"
     ALREADY_EXISTS = "already_exists"
     OLLAMA_MISSING = "ollama_missing"
     PULL_FAILED = "pull_failed"
-    CANCELLED   = "cancelled"
+    CANCELLED = "cancelled"
 
 
 def _ollama_model_exists(model_tag: str) -> bool:
@@ -40,7 +40,9 @@ def _ollama_model_exists(model_tag: str) -> bool:
     try:
         result = subprocess.run(
             ["ollama", "list"],
-            capture_output=True, text=True, timeout=10
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         return model_tag.split(":")[0] in result.stdout
     except Exception:
@@ -70,9 +72,7 @@ def _get_ollama_install_instructions() -> str:
             "Download the installer from: https://ollama.com/download/windows\n"
             "Run the installer, then Ollama will start automatically."
         )
-    return (
-        "Ollama not found. Visit https://ollama.com/download to install."
-    )
+    return "Ollama not found. Visit https://ollama.com/download to install."
 
 
 def _get_gguf_fallback(model_name: str) -> str:
@@ -105,7 +105,7 @@ def pull_model(
     """
     if not shutil.which("ollama"):
         instructions = _get_ollama_install_instructions()
-        fallback     = _get_gguf_fallback(model_tag)
+        fallback = _get_gguf_fallback(model_tag)
         return DownloadResult.OLLAMA_MISSING, instructions + fallback
 
     if check_existing and _ollama_model_exists(model_tag):
@@ -126,7 +126,7 @@ def pull_model(
 
         for line in process.stdout:  # type: ignore[union-attr]
             cleaned = _clean(line)
-            if cleaned:                  # skip blank / pure-escape lines
+            if cleaned:  # skip blank / pure-escape lines
                 output_lines.append(cleaned)
                 if on_output:
                     on_output(cleaned)
@@ -135,14 +135,11 @@ def pull_model(
 
         if process.returncode == 0:
             return DownloadResult.SUCCESS, f"Model '{model_tag}' downloaded successfully."
-        else:
-            # Only keep lines that look like actual error messages
-            error_lines = [
-                ln for ln in output_lines
-                if ln.startswith("Error") or "error" in ln.lower() or "failed" in ln.lower()
-            ] or output_lines[-5:]
-            err = "\n".join(error_lines)
-            return DownloadResult.PULL_FAILED, f"ollama pull failed:\n{err}"
+        error_lines = [
+            ln for ln in output_lines if ln.startswith("Error") or "error" in ln.lower() or "failed" in ln.lower()
+        ] or output_lines[-5:]
+        err = "\n".join(error_lines)
+        return DownloadResult.PULL_FAILED, f"ollama pull failed:\n{err}"
 
     except KeyboardInterrupt:
         try:
@@ -167,6 +164,7 @@ def start_ollama_serve() -> subprocess.Popen | None:
     # Check if already running
     try:
         import urllib.request
+
         urllib.request.urlopen("http://localhost:11434", timeout=2)
         return None  # already running
     except Exception:
@@ -192,7 +190,9 @@ def list_installed_models() -> list[str]:
     try:
         result = subprocess.run(
             ["ollama", "list"],
-            capture_output=True, text=True, timeout=10
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         lines = result.stdout.strip().splitlines()
         models = []

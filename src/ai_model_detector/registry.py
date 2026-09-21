@@ -17,8 +17,8 @@ logger = logging.getLogger(__name__)
 
 OLLAMA_LIBRARY_URL = "https://ollama.com/library"
 OLLAMA_API_SHOW_URL = "https://ollama.com/api/show"
-OLLAMA_SEARCH_URL   = "https://ollama.com/search"
-OLLAMA_MODEL_API    = "https://ollama.com/api/models"  # undocumented but returns tag lists
+OLLAMA_SEARCH_URL = "https://ollama.com/search"
+OLLAMA_MODEL_API = "https://ollama.com/api/models"  # undocumented but returns tag lists
 
 HF_API_URL = "https://huggingface.co/api/models"
 
@@ -34,23 +34,24 @@ USER_AGENT = "AI-Model-Detector/1.0 (https://github.com/eliekh05/AI-Model-Detect
 
 @dataclass
 class ModelInfo:
-    name: str                     # e.g. "llama3.2"
-    tag: str                      # e.g. "3b", "7b", "70b"
-    full_tag: str                 # e.g. "llama3.2:3b"
-    size_gb: float                # approximate disk size
-    ram_required_gb: float        # minimum RAM to run comfortably
-    vram_required_gb: float       # 0 if CPU-only is fine
-    quantization: str             # e.g. "q4_0", "q4_K_M", "f16"
+    name: str  # e.g. "llama3.2"
+    tag: str  # e.g. "3b", "7b", "70b"
+    full_tag: str  # e.g. "llama3.2:3b"
+    size_gb: float  # approximate disk size
+    ram_required_gb: float  # minimum RAM to run comfortably
+    vram_required_gb: float  # 0 if CPU-only is fine
+    quantization: str  # e.g. "q4_0", "q4_K_M", "f16"
     description: str
-    categories: list[str] = field(default_factory=list)   # ["chat", "code", "vision"]
-    known_issues: list[str] = field(default_factory=list) # from community sources
-    hf_downloads: int = 0         # Hugging Face download count (0 if N/A)
-    ollama_pull_count: int = 0    # from Ollama library page
-    source: str = "ollama"        # "ollama" | "huggingface"
-    ollama_pullable: bool = True   # False for HF-only models that need manual download
+    categories: list[str] = field(default_factory=list)  # ["chat", "code", "vision"]
+    known_issues: list[str] = field(default_factory=list)  # from community sources
+    hf_downloads: int = 0  # Hugging Face download count (0 if N/A)
+    ollama_pull_count: int = 0  # from Ollama library page
+    source: str = "ollama"  # "ollama" | "huggingface"
+    ollama_pullable: bool = True  # False for HF-only models that need manual download
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# ── helpers ───────────────────────────────────────────────────────────
+
 
 def _http_get(url: str, params: dict | None = None, timeout: int = REQUEST_TIMEOUT) -> requests.Response | None:
     try:
@@ -65,6 +66,7 @@ def _http_get(url: str, params: dict | None = None, timeout: int = REQUEST_TIMEO
 
 # ── Ollama library scraper ────────────────────────────────────────────────────
 
+
 def _parse_size_to_gb(size_str: str) -> float:
     """Convert strings like '3.8GB', '2.0 GB', '500MB' to float GB."""
     size_str = size_str.strip().upper()
@@ -72,7 +74,7 @@ def _parse_size_to_gb(size_str: str) -> float:
     if not match:
         return 0.0
     value = float(match.group(1))
-    unit  = match.group(2)
+    unit = match.group(2)
     if unit == "MB":
         return round(value / 1024, 3)
     if unit == "TB":
@@ -83,7 +85,7 @@ def _parse_size_to_gb(size_str: str) -> float:
 def _ram_from_size(size_gb: float, has_gpu: bool) -> tuple[float, float]:
     """Estimate RAM / VRAM needed given model size."""
     # Typical rule: model size × 1.2 for RAM overhead, full size for VRAM
-    ram  = round(size_gb * 1.25, 1)
+    ram = round(size_gb * 1.25, 1)
     vram = round(size_gb * 1.1, 1) if has_gpu else 0.0
     return ram, vram
 
@@ -119,7 +121,8 @@ def _fetch_ollama_library() -> list[ModelInfo]:
     # Also try embedded JSON
     for block in re.findall(
         r'<script[^>]*type=["\']application/json["\'][^>]*>(.*?)</script>',
-        html, re.DOTALL,
+        html,
+        re.DOTALL,
     ):
         try:
             data = json.loads(block)
@@ -148,7 +151,8 @@ def _fetch_ollama_library() -> list[ModelInfo]:
         # Extract description
         desc_m = re.search(
             r'<p[^>]*class="[^"]*(?:description|subtitle)[^"]*"[^>]*>(.*?)</p>',
-            page_html, re.DOTALL,
+            page_html,
+            re.DOTALL,
         )
         if desc_m:
             description = re.sub(r"<[^>]+>", "", desc_m.group(1)).strip()
@@ -202,15 +206,15 @@ def _fetch_ollama_library() -> list[ModelInfo]:
             ):
                 candidate = tm.group(1)
                 # Filter: must look like a valid Ollama tag
-                if (re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_.\-]*$', candidate)
-                        and candidate != slug
-                        and candidate not in {t for t, _ in tag_entries}):
+                if (
+                    re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_.\-]*$', candidate)
+                    and candidate != slug
+                    and candidate not in {t for t, _ in tag_entries}
+                ):
                     tag_entries.append((candidate, size_map.get(candidate, 0.0)))
 
         # Update sizes from size_map
-        tag_entries = [
-            (tag, size_map.get(tag, size)) for tag, size in tag_entries
-        ]
+        tag_entries = [(tag, size_map.get(tag, size)) for tag, size in tag_entries]
 
         categories = _infer_categories(slug, description)
 
@@ -224,20 +228,22 @@ def _fetch_ollama_library() -> list[ModelInfo]:
             ram_gb, vram_gb = _ram_from_size(size_gb, has_gpu=True)
             quant = _infer_quantization(tag_name)
 
-            models.append(ModelInfo(
-                name=slug,
-                tag=tag_name,
-                full_tag=f"{slug}:{tag_name}",
-                size_gb=size_gb,
-                ram_required_gb=ram_gb,
-                vram_required_gb=vram_gb,
-                quantization=quant,
-                description=description,
-                categories=categories,
-                ollama_pull_count=pull_count,
-                source="ollama",
-                ollama_pullable=True,
-            ))
+            models.append(
+                ModelInfo(
+                    name=slug,
+                    tag=tag_name,
+                    full_tag=f"{slug}:{tag_name}",
+                    size_gb=size_gb,
+                    ram_required_gb=ram_gb,
+                    vram_required_gb=vram_gb,
+                    quantization=quant,
+                    description=description,
+                    categories=categories,
+                    ollama_pull_count=pull_count,
+                    source="ollama",
+                    ollama_pullable=True,
+                )
+            )
 
     return models
 
@@ -262,9 +268,23 @@ def _infer_categories(name: str, description: str) -> list[str]:
 
 def _infer_quantization(tag: str) -> str:
     tag_lower = tag.lower()
-    for quant in ["q8_0", "q6_k", "q5_k_m", "q5_k_s", "q5_0",
-                  "q4_k_m", "q4_k_s", "q4_0", "q3_k_m", "q3_k_s",
-                  "q2_k", "f16", "f32", "bf16", "iq4_xs"]:
+    for quant in [
+        "q8_0",
+        "q6_k",
+        "q5_k_m",
+        "q5_k_s",
+        "q5_0",
+        "q4_k_m",
+        "q4_k_s",
+        "q4_0",
+        "q3_k_m",
+        "q3_k_s",
+        "q2_k",
+        "f16",
+        "f32",
+        "bf16",
+        "iq4_xs",
+    ]:
         if quant in tag_lower:
             return quant
     # Numeric size hints
@@ -274,6 +294,7 @@ def _infer_quantization(tag: str) -> str:
 
 
 # ── Hugging Face supplemental data ───────────────────────────────────────────
+
 
 def _fetch_hf_popular_models(limit: int = 30) -> list[ModelInfo]:
     """Fetch popular GGUF models from Hugging Face for cross-referencing."""
@@ -305,20 +326,22 @@ def _fetch_hf_popular_models(limit: int = 30) -> list[ModelInfo]:
             if not categories:
                 categories.append("chat")
 
-            models.append(ModelInfo(
-                name=model_id,
-                tag="latest",
-                full_tag=model_id,
-                size_gb=0.0,
-                ram_required_gb=0.0,
-                vram_required_gb=0.0,
-                quantization="gguf",
-                description=description or f"HuggingFace GGUF (manual download): {model_id}",
-                categories=categories,
-                hf_downloads=downloads,
-                source="huggingface",
-                ollama_pullable=False,   # must be downloaded manually, not via ollama pull
-            ))
+            models.append(
+                ModelInfo(
+                    name=model_id,
+                    tag="latest",
+                    full_tag=model_id,
+                    size_gb=0.0,
+                    ram_required_gb=0.0,
+                    vram_required_gb=0.0,
+                    quantization="gguf",
+                    description=description or f"HuggingFace GGUF (manual download): {model_id}",
+                    categories=categories,
+                    hf_downloads=downloads,
+                    source="huggingface",
+                    ollama_pullable=False,
+                )
+            )
     except Exception as exc:
         logger.warning("HuggingFace parse error: %s", exc)
 
@@ -326,6 +349,7 @@ def _fetch_hf_popular_models(limit: int = 30) -> list[ModelInfo]:
 
 
 # ── Community issue tracker ───────────────────────────────────────────────────
+
 
 def _fetch_known_issues() -> dict[str, list[str]]:
     """
@@ -341,7 +365,7 @@ def _fetch_known_issues() -> dict[str, list[str]]:
         data = resp.json()
         for issue in data:
             title = issue.get("title", "")
-            body  = issue.get("body", "") or ""
+            body = issue.get("body", "") or ""
             # Look for model names mentioned in the issue
             for word in re.findall(r"\b[a-z][a-z0-9._-]+\b", (title + " " + body).lower()):
                 if len(word) > 3 and word not in {"with", "from", "when", "this", "that", "have"}:
@@ -352,7 +376,8 @@ def _fetch_known_issues() -> dict[str, list[str]]:
     return issues
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+# ── Public API ──────────────────────────────────────────────────────────
+
 
 def _fetch_local_ollama_models() -> list[ModelInfo]:
     """
@@ -374,20 +399,22 @@ def _fetch_local_ollama_models() -> list[ModelInfo]:
             size_bytes = item.get("size", 0)
             size_gb = round(size_bytes / (1024**3), 2) if size_bytes else 0.0
             ram_gb, vram_gb = _ram_from_size(size_gb, has_gpu=True)
-            models.append(ModelInfo(
-                name=name,
-                tag=tag,
-                full_tag=full,
-                size_gb=size_gb,
-                ram_required_gb=ram_gb,
-                vram_required_gb=vram_gb,
-                quantization=_infer_quantization(tag),
-                description="Already installed locally",
-                categories=_infer_categories(name, ""),
-                ollama_pull_count=0,
-                source="ollama",
-                ollama_pullable=True,
-            ))
+            models.append(
+                ModelInfo(
+                    name=name,
+                    tag=tag,
+                    full_tag=full,
+                    size_gb=size_gb,
+                    ram_required_gb=ram_gb,
+                    vram_required_gb=vram_gb,
+                    quantization=_infer_quantization(tag),
+                    description="Already installed locally",
+                    categories=_infer_categories(name, ""),
+                    ollama_pull_count=0,
+                    source="ollama",
+                    ollama_pullable=True,
+                )
+            )
         return models
     except Exception:
         return []
@@ -436,7 +463,7 @@ def fetch_registry(include_hf: bool = True) -> list[ModelInfo]:
     all_models.sort(
         key=lambda m: (
             int(m.ollama_pullable),
-            int(m.size_gb > 0),           # known-size models rank above unknown
+            int(m.size_gb > 0),
             m.ollama_pull_count + m.hf_downloads,
         ),
         reverse=True,

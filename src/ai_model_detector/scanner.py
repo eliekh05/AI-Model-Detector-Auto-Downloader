@@ -43,11 +43,11 @@ class GPUDevice:
     name: str
     vram_gb: float | None
     driver_version: str | None
-    metal_support: bool        # macOS Metal
+    metal_support: bool  # macOS Metal
     cuda_version: str | None
     rocm_version: str | None
     vulkan_support: bool
-    is_integrated: bool = False   # True for Intel/AMD iGPU sharing system RAM
+    is_integrated: bool = False  # True for Intel/AMD iGPU sharing system RAM
 
 
 @dataclass
@@ -68,13 +68,14 @@ class SystemProfile:
     disk: DiskProfile | None = None
     ollama_installed: bool = False
     ollama_version: str | None = None
-    source: str = "live_scan"   # "live_scan" | "spx_import"
+    source: str = "live_scan"  # "live_scan" | "spx_import"
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
-# ── CPU helpers ────────────────────────────────────────────────────────────────
+# ── CPU helpers ──────────────────────────────────────────────────────────
+
 
 def _detect_cpu_flags() -> dict:
     """Parse /proc/cpuinfo on Linux; use sysctl/cpuinfo on macOS; wmic on Windows."""
@@ -87,10 +88,10 @@ def _detect_cpu_flags() -> dict:
                 for line in f:
                     if line.startswith("flags"):
                         parts = line.split(":")[1].split()
-                        flags["avx"]    = "avx"    in parts
-                        flags["avx2"]   = "avx2"   in parts
-                        flags["avx512f"]= "avx512f" in parts
-                        flags["f16c"]   = "f16c"   in parts
+                        flags["avx"] = "avx" in parts
+                        flags["avx2"] = "avx2" in parts
+                        flags["avx512f"] = "avx512f" in parts
+                        flags["f16c"] = "f16c" in parts
                         break
         except Exception:
             pass
@@ -102,7 +103,10 @@ def _detect_cpu_flags() -> dict:
         try:
             r1 = subprocess.run(
                 ["sysctl", "-n", "machdep.cpu.features"],
-                capture_output=True, text=True, timeout=5, check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
             )
             feat = r1.stdout.upper()
         except Exception:
@@ -111,23 +115,28 @@ def _detect_cpu_flags() -> dict:
         try:
             r2 = subprocess.run(
                 ["sysctl", "-n", "machdep.cpu.leaf7_features"],
-                capture_output=True, text=True, timeout=5, check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
             )
             leaf7 = r2.stdout.upper()
         except Exception:
             leaf7 = ""
 
         combined = feat + " " + leaf7
-        flags["avx"]     = "AVX1.0" in combined or "AVX " in combined
-        flags["avx2"]    = "AVX2" in combined
+        flags["avx"] = "AVX1.0" in combined or "AVX " in combined
+        flags["avx2"] = "AVX2" in combined
         flags["avx512f"] = "AVX512F" in combined
-        flags["f16c"]    = "F16C" in combined
+        flags["f16c"] = "F16C" in combined
 
     elif system == "Windows":
         try:
             subprocess.run(
                 ["wmic", "cpu", "get", "Caption,Name"],
-                capture_output=True, text=True, timeout=10
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             # Windows doesn't expose flags easily; mark unknown
         except Exception:
@@ -151,7 +160,9 @@ def _cpu_brand() -> str:
         try:
             result = subprocess.run(
                 ["sysctl", "-n", "machdep.cpu.brand_string"],
-                capture_output=True, text=True, timeout=5
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
             return result.stdout.strip()
         except Exception:
@@ -160,9 +171,11 @@ def _cpu_brand() -> str:
         try:
             result = subprocess.run(
                 ["wmic", "cpu", "get", "Name"],
-                capture_output=True, text=True, timeout=10
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
-            lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+            lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
             if len(lines) > 1:
                 return lines[1]
         except Exception:
@@ -193,7 +206,8 @@ def _scan_cpu() -> CPUProfile:
     )
 
 
-# ── RAM helpers ────────────────────────────────────────────────────────────────
+# ── RAM helpers ──────────────────────────────────────────────────────────
+
 
 def _ram_speed_mhz() -> int | None:
     system = platform.system()
@@ -201,7 +215,9 @@ def _ram_speed_mhz() -> int | None:
         try:
             result = subprocess.run(
                 ["dmidecode", "--type", "17"],
-                capture_output=True, text=True, timeout=5
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
             for line in result.stdout.splitlines():
                 if "Speed:" in line and "MT/s" in line:
@@ -215,7 +231,9 @@ def _ram_speed_mhz() -> int | None:
         try:
             result = subprocess.run(
                 ["system_profiler", "SPMemoryDataType", "-json"],
-                capture_output=True, text=True, timeout=10
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             data = json.loads(result.stdout)
             items = data.get("SPMemoryDataType", [])
@@ -230,9 +248,11 @@ def _ram_speed_mhz() -> int | None:
         try:
             result = subprocess.run(
                 ["wmic", "memorychip", "get", "Speed"],
-                capture_output=True, text=True, timeout=10
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
-            lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+            lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
             if len(lines) > 1 and lines[1].isdigit():
                 return int(lines[1])
         except Exception:
@@ -249,7 +269,8 @@ def _scan_ram() -> RAMProfile:
     )
 
 
-# ── GPU helpers ────────────────────────────────────────────────────────────────
+# ── GPU helpers ──────────────────────────────────────────────────────────
+
 
 def _nvidia_gpus() -> list[GPUDevice]:
     if not shutil.which("nvidia-smi"):
@@ -261,7 +282,9 @@ def _nvidia_gpus() -> list[GPUDevice]:
                 "--query-gpu=name,memory.total,driver_version",
                 "--format=csv,noheader,nounits",
             ],
-            capture_output=True, text=True, timeout=10
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         devices = []
         for line in result.stdout.strip().splitlines():
@@ -275,21 +298,25 @@ def _nvidia_gpus() -> list[GPUDevice]:
             try:
                 cv = subprocess.run(
                     ["nvidia-smi", "--query-gpu=cuda_version", "--format=csv,noheader"],
-                    capture_output=True, text=True, timeout=5
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
                 )
                 cuda_ver = cv.stdout.strip().splitlines()[0].strip() or None
             except Exception:
                 pass
 
-            devices.append(GPUDevice(
-                name=name,
-                vram_gb=vram_gb,
-                driver_version=driver,
-                metal_support=False,
-                cuda_version=cuda_ver,
-                rocm_version=None,
-                vulkan_support=True,  # NVIDIA supports Vulkan
-            ))
+            devices.append(
+                GPUDevice(
+                    name=name,
+                    vram_gb=vram_gb,
+                    driver_version=driver,
+                    metal_support=False,
+                    cuda_version=cuda_ver,
+                    rocm_version=None,
+                    vulkan_support=True,
+                )
+            )
         return devices
     except Exception:
         return []
@@ -312,7 +339,9 @@ def _amd_gpus() -> list[GPUDevice]:
         try:
             r = subprocess.run(
                 ["rocm-smi", "--showproductname", "--json"],
-                capture_output=True, text=True, timeout=10
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             data = json.loads(r.stdout)
             for card_id, info in data.items():
@@ -320,22 +349,26 @@ def _amd_gpus() -> list[GPUDevice]:
                 try:
                     vr = subprocess.run(
                         ["rocm-smi", "--showmeminfo", "vram", "--json"],
-                        capture_output=True, text=True, timeout=5
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
                     )
                     vdata = json.loads(vr.stdout)
                     vram_bytes = vdata.get(card_id, {}).get("VRAM Total Memory (B)", 0)
                     vram = round(int(vram_bytes) / (1024**3), 2)
                 except Exception:
                     pass
-                devices.append(GPUDevice(
-                    name=info.get("Card Series", info.get("Card Model", "AMD GPU")),
-                    vram_gb=vram,
-                    driver_version=None,
-                    metal_support=False,
-                    cuda_version=None,
-                    rocm_version=rocm_ver,
-                    vulkan_support=True,
-                ))
+                devices.append(
+                    GPUDevice(
+                        name=info.get("Card Series", info.get("Card Model", "AMD GPU")),
+                        vram_gb=vram,
+                        driver_version=None,
+                        metal_support=False,
+                        cuda_version=None,
+                        rocm_version=rocm_ver,
+                        vulkan_support=True,
+                    )
+                )
         except Exception:
             pass
     return devices
@@ -345,12 +378,14 @@ def _macos_gpus() -> list[GPUDevice]:
     try:
         result = subprocess.run(
             ["system_profiler", "SPDisplaysDataType", "-json"],
-            capture_output=True, text=True, timeout=10
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         data = json.loads(result.stdout)
         displays = data.get("SPDisplaysDataType", [])
         devices = []
-        _INTEGRATED_KW = ("iris", "uhd graphics", "hd graphics", "vega", "radeon(tm)")
+        integrated_kws = ("iris", "uhd graphics", "hd graphics", "vega", "radeon(tm)")
         for d in displays:
             name = d.get("sppci_model", "Apple GPU")
             name_lower = name.lower()
@@ -366,17 +401,19 @@ def _macos_gpus() -> list[GPUDevice]:
                     vram_gb = float(vram_str.replace("GB", "").strip())
                 except Exception:
                     pass
-            is_integrated = any(kw in name_lower for kw in _INTEGRATED_KW)
-            devices.append(GPUDevice(
-                name=name,
-                vram_gb=vram_gb,
-                driver_version=None,
-                metal_support=True,
-                cuda_version=None,
-                rocm_version=None,
-                vulkan_support=False,
-                is_integrated=is_integrated,
-            ))
+            is_integrated = any(kw in name_lower for kw in integrated_kws)
+            devices.append(
+                GPUDevice(
+                    name=name,
+                    vram_gb=vram_gb,
+                    driver_version=None,
+                    metal_support=True,
+                    cuda_version=None,
+                    rocm_version=None,
+                    vulkan_support=False,
+                    is_integrated=is_integrated,
+                )
+            )
         return devices
     except Exception:
         return []
@@ -385,12 +422,13 @@ def _macos_gpus() -> list[GPUDevice]:
 def _windows_gpus() -> list[GPUDevice]:
     try:
         result = subprocess.run(
-            ["wmic", "path", "win32_VideoController",
-             "get", "Name,AdapterRAM,DriverVersion", "/format:csv"],
-            capture_output=True, text=True, timeout=10
+            ["wmic", "path", "win32_VideoController", "get", "Name,AdapterRAM,DriverVersion", "/format:csv"],
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         devices = []
-        lines = [l.strip() for l in result.stdout.splitlines() if l.strip() and "Node" not in l]
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip() and "Node" not in line]
         for line in lines[1:]:
             parts = line.split(",")
             if len(parts) < 4:
@@ -401,15 +439,17 @@ def _windows_gpus() -> list[GPUDevice]:
                 vram_gb = round(int(vram_bytes) / (1024**3), 2)
             except Exception:
                 pass
-            devices.append(GPUDevice(
-                name=name,
-                vram_gb=vram_gb,
-                driver_version=driver,
-                metal_support=False,
-                cuda_version=None,
-                rocm_version=None,
-                vulkan_support=True,
-            ))
+            devices.append(
+                GPUDevice(
+                    name=name,
+                    vram_gb=vram_gb,
+                    driver_version=driver,
+                    metal_support=False,
+                    cuda_version=None,
+                    rocm_version=None,
+                    vulkan_support=True,
+                )
+            )
         return devices
     except Exception:
         return []
@@ -427,7 +467,8 @@ def _scan_gpus() -> list[GPUDevice]:
     return gpus
 
 
-# ── Disk ───────────────────────────────────────────────────────────────────────
+# ── Disk ───────────────────────────────────────────────────────────────
+
 
 def _scan_disk() -> DiskProfile:
     home = Path.home()
@@ -439,7 +480,8 @@ def _scan_disk() -> DiskProfile:
     )
 
 
-# ── Ollama detection ───────────────────────────────────────────────────────────
+# ── Ollama detection ───────────────────────────────────────────────────────
+
 
 def _detect_ollama() -> tuple[bool, str | None]:
     if not shutil.which("ollama"):
@@ -452,7 +494,8 @@ def _detect_ollama() -> tuple[bool, str | None]:
         return True, None
 
 
-# ── .spx import ───────────────────────────────────────────────────────────────
+# ── .spx import ───────────────────────────────────────────────────────────
+
 
 def _parse_spx(spx_path: Path) -> SystemProfile:
     """
@@ -502,15 +545,17 @@ def _parse_spx(spx_path: Path) -> SystemProfile:
     gpu_items = gpu_data.get("SPDisplaysDataType", [])
     gpus = []
     for g in gpu_items:
-        gpus.append(GPUDevice(
-            name=g.get("sppci_model", "Apple GPU"),
-            vram_gb=None,
-            driver_version=None,
-            metal_support=True,
-            cuda_version=None,
-            rocm_version=None,
-            vulkan_support=False,
-        ))
+        gpus.append(
+            GPUDevice(
+                name=g.get("sppci_model", "Apple GPU"),
+                vram_gb=None,
+                driver_version=None,
+                metal_support=True,
+                cuda_version=None,
+                rocm_version=None,
+                vulkan_support=False,
+            )
+        )
 
     ollama_installed, ollama_ver = _detect_ollama()
     return SystemProfile(
@@ -527,7 +572,8 @@ def _parse_spx(spx_path: Path) -> SystemProfile:
     )
 
 
-# ── Main scan ─────────────────────────────────────────────────────────────────
+# ── Main scan ────────────────────────────────────────────────────────────
+
 
 def scan_system(spx_path: Path | None = None) -> SystemProfile:
     """

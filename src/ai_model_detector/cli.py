@@ -28,11 +28,7 @@ from .display import (
     print_system_profile,
     spinner,
 )
-from .downloader import (
-    list_installed_models,
-    pull_model,
-    start_ollama_serve,
-)
+from .downloader import list_installed_models, pull_model, start_ollama_serve
 from .registry import fetch_registry
 from .scanner import scan_system
 from .scorer import rank_models
@@ -50,43 +46,56 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument(
-        "--import", dest="spx_file", metavar="FILE",
-        help="Import a macOS .spx system profile instead of scanning live hardware."
+        "--import",
+        dest="spx_file",
+        metavar="FILE",
+        help="Import a macOS .spx system profile instead of scanning live hardware.",
     )
     parser.add_argument(
-        "--category", metavar="CATEGORY",
-        help="Filter recommendations by category: chat, code, vision, math, reasoning, embedding"
+        "--category",
+        metavar="CATEGORY",
+        help="Filter recommendations by category: chat, code, vision, math, reasoning, embedding",
     )
     parser.add_argument(
-        "--top", type=int, default=5, metavar="N",
-        help="Number of top recommendations to show (default: 5)"
+        "--top",
+        type=int,
+        default=5,
+        metavar="N",
+        help="Number of top recommendations to show (default: 5)",
     )
     parser.add_argument(
-        "--json", dest="output_json", action="store_true",
-        help="Output full results as JSON and exit."
+        "--json",
+        dest="output_json",
+        action="store_true",
+        help="Output full results as JSON and exit.",
     )
     parser.add_argument(
-        "--installed", action="store_true",
-        help="List already-installed Ollama models and exit."
+        "--installed",
+        action="store_true",
+        help="List already-installed Ollama models and exit.",
     )
     parser.add_argument(
-        "--pull", metavar="MODEL",
-        help="Pull a specific model tag directly (e.g. llama3.2:3b)."
+        "--pull",
+        metavar="MODEL",
+        help="Pull a specific model tag directly (e.g. llama3.2:3b).",
     )
     parser.add_argument(
-        "--no-hf", action="store_true",
-        help="Skip Hugging Face supplemental model data."
+        "--no-hf",
+        action="store_true",
+        help="Skip Hugging Face supplemental model data.",
     )
     parser.add_argument(
-        "--verbose", "-v", action="store_true",
-        help="Enable verbose logging."
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable verbose logging.",
     )
     return parser
 
 
 def run() -> None:
     parser = _build_parser()
-    args   = parser.parse_args()
+    args = parser.parse_args()
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.WARNING,
@@ -143,7 +152,7 @@ def run() -> None:
         f"\n[dim]Registry loaded: {len(registry)} model variants from live sources[/]"
     )
 
-    # ── Score & rank ──────────────────────────────────────────────────────────
+    # ── Score & rank ─────────────────────────────────────────────────────────
     with spinner("Scoring models against your hardware…") as prog:
         prog.add_task("", total=None)
         ranked = rank_models(
@@ -174,7 +183,7 @@ def run() -> None:
                     "explanation": sm.explanation,
                     "warnings": sm.warnings,
                 }
-                for i, sm in enumerate(ranked[:args.top])
+                for i, sm in enumerate(ranked[: args.top])
             ],
         }
         print(json.dumps(output, indent=2, default=str))
@@ -212,7 +221,7 @@ def run() -> None:
         # Let the user pick from Ollama-pullable models only
         pullable_choices = {
             str(i + 1): sm.model.full_tag
-            for i, sm in enumerate(pullable[:args.top])
+            for i, sm in enumerate(pullable[: args.top])
         }
         pullable_choices["s"] = "skip"
 

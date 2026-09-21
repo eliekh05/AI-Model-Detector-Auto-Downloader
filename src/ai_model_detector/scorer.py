@@ -10,10 +10,7 @@ def _classify_gpu(gpus: list[GPUDevice], os_name: str, os_arch: str) -> tuple[GP
         return GPUTier.NONE, 0.0
 
     # Apple Silicon detection — architecture is arm64 + Darwin.
-    is_apple_silicon = (
-        os_name == "Darwin"
-        and "arm" in os_arch.lower()
-    )
+    is_apple_silicon = os_name == "Darwin" and "arm" in os_arch.lower()
 
     # Explicit GPU metadata should win over the host-platform heuristic.
     # A simulated Intel Iris iGPU on ARM macOS must not be reclassified as
@@ -22,8 +19,7 @@ def _classify_gpu(gpus: list[GPUDevice], os_name: str, os_arch: str) -> tuple[GP
         name_lower = gpu.name.lower()
         if gpu.is_integrated:
             is_apple_gpu = any(
-                keyword in name_lower
-                for keyword in ("apple", "m1", "m2", "m3", "m4")
+                keyword in name_lower for keyword in ("apple", "m1", "m2", "m3", "m4")
             )
             if not (is_apple_silicon and is_apple_gpu):
                 return GPUTier.INTEGRATED, 0.0
@@ -42,9 +38,21 @@ def _classify_gpu(gpus: list[GPUDevice], os_name: str, os_arch: str) -> tuple[GP
 
     # Integrated GPU detection — Intel/AMD iGPU keywords
     _INTEGRATED_KEYWORDS = (
-        "iris", "uhd", "hd graphics", "radeon vega", "radeon rx vega",
-        "amd radeon(tm)", "intel(r) hd", "intel(r) uhd", "intel(r) iris",
-        "vega 8", "vega 11", "llano", "trinity", "kaveri", "renoir",
+        "iris",
+        "uhd",
+        "hd graphics",
+        "radeon vega",
+        "radeon rx vega",
+        "amd radeon(tm)",
+        "intel(r) hd",
+        "intel(r) uhd",
+        "intel(r) iris",
+        "vega 8",
+        "vega 11",
+        "llano",
+        "trinity",
+        "kaveri",
+        "renoir",
     )
     for gpu in gpus:
         name_lower = gpu.name.lower()
@@ -62,6 +70,6 @@ def _classify_gpu(gpus: list[GPUDevice], os_name: str, os_arch: str) -> tuple[GP
     # Discrete but unknown backend
     best_vram = max((g.vram_gb or 0.0) for g in gpus)
     return (
-    GPUTier.INTEGRATED if best_vram == 0 else GPUTier.DISCRETE_CUDA,
-    best_vram,
-  )
+        GPUTier.INTEGRATED if best_vram == 0 else GPUTier.DISCRETE_CUDA,
+        best_vram,
+    )
