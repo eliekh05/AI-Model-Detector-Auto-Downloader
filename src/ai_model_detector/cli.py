@@ -145,11 +145,14 @@ def _interactive_install(ranked, top_n: int) -> None:
             _confirm_and_pull(risky_top.model.full_tag)
             return
     elif risky_top is not None:
-        console.print("[yellow]No verified FITS/TIGHT/RISKY install candidate is available.[/]")
+        console.print(
+            "[yellow]No verified model currently fits the available memory. "
+            "Automatic installation is disabled.[/]"
+        )
         if Confirm.ask(
             f"[bold red]Override[/] and install "
             f"[cyan]{risky_top.model.full_tag}[/] "
-            f"({risky_top.ram_fit.value}, unverified/unsuitable) anyway?",
+            f"({risky_top.ram_fit.value}) anyway?",
             default=False,
         ):
             _confirm_and_pull(risky_top.model.full_tag)
@@ -169,7 +172,8 @@ def _interactive_install(ranked, top_n: int) -> None:
     console.print("\n[dim]Ollama-installable options:[/]")
     for k, sm in pullable_choices.items():
         flag = "verified" if sm.verified else "UNVERIFIED"
-        console.print(f"  [{k}] {sm.model.full_tag}  ({sm.ram_fit.value}, {flag}, score {sm.score:.0f})")
+        labels = ", ".join(sm.label_names[:2]) if sm.labels else "—"
+        console.print(f"  [{k}] {sm.model.full_tag}  ({sm.ram_fit.value}, {flag}; {labels})")
     console.print("  [s] Skip / exit\n")
 
     choice = Prompt.ask(
@@ -254,8 +258,8 @@ def run() -> None:
 
     console.print(f"\n[dim]Registry loaded: {len(registry)} model variants from live sources[/]")
 
-    # ── Score & rank ─────────────────────────────────────────────────────────
-    with spinner("Scoring models against your hardware…") as prog:
+    # ── Evaluate & recommend ─────────────────────────────────────────────────
+    with spinner("Evaluating models against your hardware…") as prog:
         prog.add_task("", total=None)
         ranked = rank_models(
             registry,
@@ -276,7 +280,6 @@ def run() -> None:
                 {
                     "rank": i + 1,
                     "model": sm.model.__dict__,
-                    "score": sm.score,
                     "ram_fit": sm.ram_fit.value,
                     "fits_ram": sm.fits_ram,
                     "fits_vram": sm.fits_vram,
@@ -284,6 +287,7 @@ def run() -> None:
                     "verified": sm.verified,
                     "unverified": sm.unverified,
                     "installable": sm.installable,
+                    "pullable": sm.installable,
                     "runtime_compatible": sm.runtime_compatible,
                     "acceleration": sm.acceleration.value,
                     "gpu_detected": sm.gpu_detected,
@@ -295,6 +299,7 @@ def run() -> None:
                     "missing_metadata": sm.missing_metadata,
                     "params_b": sm.params_b,
                     "will_use_gpu": sm.will_use_gpu,
+                    "labels": sm.label_names,
                     "rank_reason": sm.rank_reason,
                     "explanation": sm.explanation,
                     "warnings": sm.warnings,

@@ -456,7 +456,7 @@ def fetch_registry(include_hf: bool = True) -> list[ModelInfo]:
 
     # Sort: Ollama-pullable first, then by popularity desc.
     # Within Ollama models, prefer ones with known sizes (size_gb > 0) so the
-    # scorer can actually rank them by hardware fit rather than all tying.
+    # evaluator can classify hardware fit rather than leaving everything UNKNOWN.
     all_models.sort(
         key=lambda m: (
             int(m.ollama_pullable),

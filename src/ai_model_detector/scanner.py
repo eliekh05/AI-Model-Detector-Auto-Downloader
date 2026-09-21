@@ -2,7 +2,7 @@
 scanner.py — Deep system hardware profiler.
 
 Collects OS, CPU, RAM, GPU, disk, and driver information to build
-a full hardware profile used for model recommendation scoring.
+a full hardware profile used for model compatibility evaluation.
 Supports .spx imports on macOS (system_profiler XML exports).
 """
 

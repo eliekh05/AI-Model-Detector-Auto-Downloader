@@ -12,10 +12,10 @@ from .scanner import SystemProfile
 from .scorer import (
     AccelerationStatus,
     Confidence,
+    EvaluatedModel,
     GPUTier,
     PerformanceBasis,
     RAMFit,
-    ScoredModel,
 )
 
 console = Console()
@@ -116,7 +116,7 @@ def _accel_profile_str(accel: AccelerationStatus, tier: GPUTier) -> str:
     if accel == AccelerationStatus.ROCM:
         return "[green]ROCm (discrete AMD)[/]"
     if accel == AccelerationStatus.UNVERIFIED:
-        return "[yellow]unverified / backend-dependent[/] [dim](iGPU detected — scoring uses CPU-only)[/]"
+        return "[yellow]unverified / backend-dependent[/] [dim](iGPU detected — do not assume LLM acceleration)[/]"
     if tier == GPUTier.NONE:
         return "CPU-only"
     return "CPU-only"
@@ -141,7 +141,7 @@ def _confidence_badge(conf: Confidence) -> str:
     }[conf]
 
 
-def _accel_badge(sm: ScoredModel) -> str:
+def _accel_badge(sm: EvaluatedModel) -> str:
     if sm.acceleration == AccelerationStatus.METAL_APPLE:
         return "[green]Metal (Apple Silicon)[/]"
     if sm.acceleration == AccelerationStatus.CUDA:
@@ -149,7 +149,7 @@ def _accel_badge(sm: ScoredModel) -> str:
     if sm.acceleration == AccelerationStatus.ROCM:
         return "[green]ROCm[/]" if sm.will_use_gpu else "[yellow]ROCm (partial/offload)[/]"
     if sm.acceleration == AccelerationStatus.UNVERIFIED:
-        return "[yellow]GPU detected — LLM accel unverified (CPU-only scoring)[/]"
+        return "[yellow]GPU detected — LLM accel unverified/backend-dependent[/]"
     return "[dim]CPU-only[/]"
 
 
@@ -162,11 +162,13 @@ def _perf_basis_str(basis: PerformanceBasis) -> str:
     }[basis]
 
 
-def print_recommendations(scored: list[ScoredModel], top: int = 5, available_ram_gb: float | None = None) -> None:
+def print_recommendations(
+    evaluated: list[EvaluatedModel], top: int = 5, available_ram_gb: float | None = None
+) -> None:
     console.print()
     console.rule("[bold cyan]Model Recommendations[/]")
 
-    for shown, sm in enumerate(scored[:top], start=1):
+    for shown, sm in enumerate(evaluated[:top], start=1):
         m = sm.model
 
         if sm.disqualified:
@@ -193,12 +195,9 @@ def print_recommendations(scored: list[ScoredModel], top: int = 5, available_ram
 
         install_badge = "[green]● ollama pull[/]" if m.ollama_pullable else "[yellow]● manual download[/]"
         verified_badge = "[green]verified[/]" if sm.verified else "[dim]UNVERIFIED[/]"
+        labels_str = ", ".join(sm.label_names) if sm.labels else "—"
 
-        title = (
-            f"[bold]#{shown}[/]  [white]{m.full_tag}[/]  "
-            f"Score: {sm.score:.0f}/100  "
-            f"{fit_label}  {verified_badge}  {install_badge}"
-        )
+        title = f"[bold]#{shown}[/]  [white]{m.full_tag}[/]  {fit_label}  {verified_badge}  {install_badge}"
 
         lines: list[str] = []
 
@@ -216,15 +215,17 @@ def print_recommendations(scored: list[ScoredModel], top: int = 5, available_ram
             f"[dim]Categories:[/] {', '.join(m.categories) or '?'}"
         )
 
-        # Why ranked here
+        lines.append(f"[dim]Recommendation:[/] {labels_str}")
+
+        # Why listed here
         if sm.rank_reason:
-            lines.append(f"[dim]Why here:[/] {sm.rank_reason}")
+            lines.append(f"[dim]Evidence:[/] {sm.rank_reason}")
 
         # Separated concerns
         lines.append(
-            f"[dim]Installable:[/] {'yes' if sm.installable else 'no'}  "
+            f"[dim]Pullable:[/] {'yes' if sm.installable else 'no'}  "
             f"[dim]Runtime compatible:[/] {'yes' if sm.runtime_compatible else 'no'}  "
-            f"[dim]Fit:[/] {_ram_fit_badge(sm.ram_fit)}  "
+            f"[dim]Likely to fit:[/] {_ram_fit_badge(sm.ram_fit)}  "
             f"[dim]Mem confidence:[/] {_confidence_badge(sm.memory_confidence)}"
         )
 

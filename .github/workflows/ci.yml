@@ -19,5 +19,7 @@ jobs:
         run: pip install -e ".[dev]"
       - name: Run ruff
         run: ruff check src/
+      - name: Run tests
+        run: pytest -q
       - name: Verify package imports
-        run: python -c "from ai_model_detector import __version__; from ai_model_detector.scorer import rank_models; print(__version__)"
+        run: python -c "from ai_model_detector import __version__; from ai_model_detector.scorer import rank_models, evaluate_model; print(__version__)"

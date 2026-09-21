@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-model-detector"
-version = "1.4.0"
+version = "1.5.0"
 description = "Deep hardware scanner that recommends and auto-downloads the best local AI model for your system"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -33,6 +33,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "ruff>=0.4",
+    "pytest>=8.0",
 ]
 
 [project.urls]
@@ -47,6 +48,10 @@ where = ["src"]
 
 [tool.setuptools.package-dir]
 "" = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
 
 [tool.ruff]
 target-version = "py311"

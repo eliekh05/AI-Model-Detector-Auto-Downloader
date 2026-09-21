@@ -77,22 +77,20 @@ Every run fetches fresh data — no model list is stored in the source code:
 - **Hugging Face API** — top GGUF models by download count (shown for reference; flagged as manual-download only)
 - **Ollama GitHub issues** — open bug reports mapped to model names
 
-### 3 — Hardware-Aware Scoring
+### 3 — Compatibility Evaluation
 
-Each model variant is scored 0–100 against your specific hardware:
+Each model is assessed with **factual classifications** — there is no universal 0–100 suitability score:
 
-| Factor | Effect |
-|--------|--------|
-| Available RAM vs model RAM requirement | ±20 pts |
-| GPU VRAM vs model VRAM requirement | ±20 pts |
-| Free disk space | ±30 pts |
-| CPU instruction sets (AVX2, AVX-512) | ±5 pts |
-| Apple Silicon + Metal | +10 pts |
-| Quantization suitability (q4_K_M sweet spot) | ±8 pts |
-| Ollama-pullable (single command install) | +8 pts |
-| HuggingFace-only (manual download required) | −25 pts |
-| Community bug reports | −3 pts per issue |
-| Popularity (pull count) | +2–5 pts |
+| Signal | What you see |
+|--------|----------------|
+| Memory fit | `FITS` · `TIGHT` · `RISKY` · `DOES_NOT_FIT` · `UNKNOWN` |
+| Metadata confidence | Verified (known size) vs UNVERIFIED (incomplete metadata) |
+| Pullability | Ollama-pullable vs HuggingFace-only (pullable ≠ runnable) |
+| GPU vs acceleration | GPU name reported separately from LLM acceleration status |
+| Performance | Estimated / inferred / unknown tok/s — never claimed measured unless measured |
+| Recommendation labels | Best fit · Lowest memory · Fastest estimated · Coding · Reasoning · Experimental · Not recommended |
+
+`UNKNOWN` is never treated as `FITS`. If no verified model fits available memory, automatic installation is disabled and you must explicitly override.
 
 ### 4 — Install
 
@@ -148,7 +146,7 @@ This tool checks all of these, not just VRAM.
 src/ai_model_detector/
 ├── scanner.py    — deep hardware profiler (live + .spx import)
 ├── registry.py   — live model registry fetcher (Ollama + HuggingFace)
-├── scorer.py     — hardware-aware scoring and ranking engine
+├── scorer.py     — compatibility evaluation + explainable recommendations
 ├── downloader.py — ollama pull with ANSI-stripped streaming output
 ├── display.py    — Rich terminal UI
 └── cli.py        — CLI entry point
