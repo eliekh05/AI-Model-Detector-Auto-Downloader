@@ -18,7 +18,7 @@ from .scanner import GPUDevice, SystemProfile
 logger = logging.getLogger(__name__)
 
 
-# ── Enums ──────────────────────────────────────────────────────────────────────
+# ── Enums ────────────────────────────────────────────────────────────
 
 class RAMFit(Enum):
     FIT       = "FIT"         # comfortably fits with headroom
@@ -51,7 +51,7 @@ _OS_RESERVED_GB            = 0.50   # OS keeps ~512 MB for itself under load
 _SAFETY_HEADROOM_GB        = 0.25   # conservative safety margin
 
 # Quantization RAM multipliers relative to fp16 (≈ 2 bytes/param)
-# These express (disk_bytes × multiplier) ≈ RAM_needed for inference
+# These express (disk_bytes �� multiplier) ≈ RAM_needed for inference
 _QUANT_RAM_MULTIPLIER: dict[str, float] = {
     "f32":    2.00,   # unlikely to see in practice
     "f16":    1.00,   # baseline
@@ -127,7 +127,7 @@ def _ram_budget(model: ModelInfo, profile: SystemProfile) -> tuple[RAMFit, float
         return RAMFit.OVER, model_ram, total_required, note
 
 
-# ── GPU tier classifier ────────────────────────────────────────────────────────
+# ── GPU tier classifier ───────────────────────────────────────────────────────
 
 def _classify_gpu(gpus: list[GPUDevice], os_name: str, os_arch: str) -> tuple[GPUTier, float]:
     """
@@ -145,6 +145,13 @@ def _classify_gpu(gpus: list[GPUDevice], os_name: str, os_arch: str) -> tuple[GP
         os_name == "Darwin"
         and "arm" in os_arch.lower()
     )
+
+    # If a GPU explicitly reports itself as integrated, keep it in the
+    # integrated tier unless this is Apple's unified-memory GPU stack.
+    for gpu in gpus:
+        if gpu.is_integrated and not is_apple_silicon:
+            return GPUTier.INTEGRATED, 0.0
+
     if is_apple_silicon:
         # Unified memory — the whole RAM pool is usable via Metal
         # We report 0.0 dedicated VRAM but the tier enables GPU scoring
