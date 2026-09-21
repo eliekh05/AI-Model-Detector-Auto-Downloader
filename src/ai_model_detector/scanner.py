@@ -47,6 +47,7 @@ class GPUDevice:
     cuda_version: str | None
     rocm_version: str | None
     vulkan_support: bool
+    is_integrated: bool = False   # True for Intel/AMD iGPU sharing system RAM
 
 
 @dataclass
@@ -349,8 +350,10 @@ def _macos_gpus() -> list[GPUDevice]:
         data = json.loads(result.stdout)
         displays = data.get("SPDisplaysDataType", [])
         devices = []
+        _INTEGRATED_KW = ("iris", "uhd graphics", "hd graphics", "vega", "radeon(tm)")
         for d in displays:
             name = d.get("sppci_model", "Apple GPU")
+            name_lower = name.lower()
             vram_str = d.get("sppci_vram", "")
             vram_gb = None
             if "MB" in vram_str:
@@ -363,6 +366,7 @@ def _macos_gpus() -> list[GPUDevice]:
                     vram_gb = float(vram_str.replace("GB", "").strip())
                 except Exception:
                     pass
+            is_integrated = any(kw in name_lower for kw in _INTEGRATED_KW)
             devices.append(GPUDevice(
                 name=name,
                 vram_gb=vram_gb,
@@ -371,6 +375,7 @@ def _macos_gpus() -> list[GPUDevice]:
                 cuda_version=None,
                 rocm_version=None,
                 vulkan_support=False,
+                is_integrated=is_integrated,
             ))
         return devices
     except Exception:
