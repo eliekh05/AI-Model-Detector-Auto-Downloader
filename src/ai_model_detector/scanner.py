@@ -1,12 +1,14 @@
 """
-scanner.py — Deep system hardware profiler.
+scanner.py — Deep system hardware profiler (stdlib only, zero dependencies).
 
 Collects OS, CPU, RAM, GPU, disk, and driver information to build
 a full hardware profile used for model compatibility evaluation.
 Supports .spx imports on macOS (system_profiler XML exports).
 """
 
+import ctypes
 import json
+import os
 import platform
 import plistlib
 import shutil
@@ -14,8 +16,6 @@ import subprocess
 import zipfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-
-import psutil
 
 
 @dataclass
@@ -76,6 +76,245 @@ class SystemProfile:
         return asdict(self)
 
 
+# ── Low-level system helpers (replace psutil) ────────────────────────────
+
+
+def _sysctl_int(name: str) -> int | None:
+    """Read an integer sysctl value on macOS. Returns None on failure."""
+    try:
+        r = subprocess.run(
+            ["sysctl", "-n", name],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        return int(r.stdout.strip())
+    except Exception:
+        return None
+
+
+def _sysctl_str(name: str) -> str:
+    """Read a string sysctl value on macOS."""
+    try:
+        r = subprocess.run(
+            ["sysctl", "-n", name],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+
+def _read_file_int(path: str) -> int | None:
+    """Read a single integer from a sysfs/procfs file."""
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
+def _total_ram_bytes() -> int:
+    """Return total physical RAM in bytes using platform APIs."""
+    system = platform.system()
+    if system == "Darwin":
+        val = _sysctl_int("hw.memsize")
+        if val:
+            return val
+    elif system == "Linux":
+        val = _read_file_int("/proc/meminfo_total")
+        if val is None:
+            # Parse MemTotal from /proc/meminfo
+            try:
+                with open("/proc/meminfo") as f:
+                    for line in f:
+                        if line.startswith("MemTotal:"):
+                            parts = line.split()
+                            return int(parts[1]) * 1024  # kB to bytes
+            except Exception:
+                pass
+    elif system == "Windows":
+        try:
+            kernel32 = ctypes.windll.kernel32
+            ctypes.windll.kernel32.GetPhysicallyInstalledMemory = None
+            # GlobalMemoryStatusEx
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            mem = MEMORYSTATUSEX()
+            mem.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if kernel32.GlobalMemoryStatusEx(ctypes.byref(mem)):
+                return mem.ullTotalPhys
+        except Exception:
+            pass
+    # Fallback: try os.sysconf
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except Exception:
+        pass
+    return 0
+
+
+def _available_ram_bytes() -> int:
+    """Return currently available RAM in bytes using platform APIs."""
+    system = platform.system()
+    if system == "Darwin":
+        # pagesize × pages_free + pages_active is approximate;
+        # use hw.memsize minus wired+active from vm_stat
+        page_size = _sysctl_int("hw.pagesize") or 4096
+        try:
+            r = subprocess.run(
+                ["vm_stat"], capture_output=True, text=True, timeout=5, check=False,
+            )
+            free = speculative = 0
+            for line in r.stdout.splitlines():
+                if "Pages free" in line:
+                    free = int(line.split(":")[1].strip().rstrip(".")) * page_size
+                elif "Pages speculative" in line:
+                    speculative = int(line.split(":")[1].strip().rstrip(".")) * page_size
+            # Available ≈ free + speculative (macOS keeps active in RAM but counts toward pressure)
+            avail = free + speculative
+            if avail > 0:
+                return avail
+        except Exception:
+            pass
+    elif system == "Linux":
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        parts = line.split()
+                        return int(parts[1]) * 1024  # kB to bytes
+        except Exception:
+            pass
+    elif system == "Windows":
+        try:
+            kernel32 = ctypes.windll.kernel32
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            mem = MEMORYSTATUSEX()
+            mem.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if kernel32.GlobalMemoryStatusEx(ctypes.byref(mem)):
+                return mem.ullAvailPhys
+        except Exception:
+            pass
+    # Fallback: total / 2 as rough estimate
+    return _total_ram_bytes() // 2
+
+
+def _cpu_count_logical() -> int:
+    """Return number of logical CPU cores."""
+    count = os.cpu_count()
+    if count:
+        return count
+    system = platform.system()
+    if system == "Darwin":
+        val = _sysctl_int("hw.logicalcpu")
+        if val:
+            return val
+    return 1
+
+
+def _cpu_count_physical() -> int:
+    """Return number of physical CPU cores."""
+    system = platform.system()
+    if system == "Darwin":
+        val = _sysctl_int("hw.physicalcpu")
+        if val:
+            return val
+    elif system == "Linux":
+        try:
+            with open("/proc/cpuinfo") as f:
+                ids = set()
+                for line in f:
+                    if line.startswith("physical id"):
+                        ids.add(line.split(":")[1].strip())
+                # Count unique physical ids × cores per id
+                f.seek(0)
+                core_ids = set()
+                for line in f:
+                    if line.startswith("core id"):
+                        core_ids.add(line.split(":")[1].strip())
+                if ids and core_ids:
+                    return len(ids) * len(core_ids)
+        except Exception:
+            pass
+    elif system == "Windows":
+        try:
+            r = subprocess.run(
+                ["wmic", "cpu", "get", "NumberOfCores"],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            lines = [l.strip() for l in r.stdout.splitlines() if l.strip() and l.strip() != "NumberOfCores"]
+            if lines:
+                return int(lines[0])
+        except Exception:
+            pass
+    # Fallback
+    return max(1, _cpu_count_logical() // 2)
+
+
+def _cpu_freq_mhz() -> float:
+    """Return max CPU frequency in MHz."""
+    system = platform.system()
+    if system == "Darwin":
+        # hw.cpufrequency is in Hz on some Macs
+        val = _sysctl_int("hw.cpufrequency")
+        if val and val > 1000:
+            return round(val / 1_000_000, 1)
+        # Try machdep.cpu.brand_string for "X.XXGHz"
+        brand = _sysctl_str("machdep.cpu.brand_string")
+        if "GHz" in brand:
+            try:
+                ghz_str = brand.split("GHz")[0].split()[-1]
+                return round(float(ghz_str) * 1000, 1)
+            except Exception:
+                pass
+    elif system == "Linux":
+        try:
+            with open("/proc/cpuinfo") as f:
+                for line in f:
+                    if "cpu MHz" in line:
+                        val = float(line.split(":")[1].strip())
+                        return round(val, 1)
+        except Exception:
+            pass
+        # sysfs fallback
+        freq = _read_file_int("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
+        if freq:
+            return round(freq / 1000, 1)
+    elif system == "Windows":
+        try:
+            r = subprocess.run(
+                ["wmic", "cpu", "get", "MaxClockSpeed"],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            lines = [l.strip() for l in r.stdout.splitlines() if l.strip() and l.strip() != "MaxClockSpeed"]
+            if lines:
+                return float(lines[0])
+        except Exception:
+            pass
+    return 0.0
+
+
 # ── CPU helpers ──────────────────────────────────────────────────────────
 
 
@@ -99,16 +338,10 @@ def _detect_cpu_flags() -> dict:
             pass
 
     elif system == "Darwin":
-        # machdep.cpu.features  → legacy SSE/AVX flags (AVX1.0, F16C …)
-        # machdep.cpu.leaf7_features → newer flags (AVX2, BMI1/2, AVX512 …)
-        # We must query BOTH because AVX2 only appears in leaf7_features on Intel Macs.
         try:
             r1 = subprocess.run(
                 ["sysctl", "-n", "machdep.cpu.features"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
+                capture_output=True, text=True, timeout=5, check=False,
             )
             feat = r1.stdout.upper()
         except Exception:
@@ -117,10 +350,7 @@ def _detect_cpu_flags() -> dict:
         try:
             r2 = subprocess.run(
                 ["sysctl", "-n", "machdep.cpu.leaf7_features"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
+                capture_output=True, text=True, timeout=5, check=False,
             )
             leaf7 = r2.stdout.upper()
         except Exception:
@@ -136,11 +366,8 @@ def _detect_cpu_flags() -> dict:
         try:
             subprocess.run(
                 ["wmic", "cpu", "get", "Caption,Name"],
-                capture_output=True,
-                text=True,
-                timeout=10,
+                capture_output=True, text=True, timeout=10, check=False,
             )
-            # Windows doesn't expose flags easily; mark unknown
         except Exception:
             pass
 
@@ -159,23 +386,14 @@ def _cpu_brand() -> str:
         except Exception:
             pass
     elif system == "Darwin":
-        try:
-            result = subprocess.run(
-                ["sysctl", "-n", "machdep.cpu.brand_string"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            return result.stdout.strip()
-        except Exception:
-            pass
+        brand = _sysctl_str("machdep.cpu.brand_string")
+        if brand:
+            return brand
     elif system == "Windows":
         try:
             result = subprocess.run(
                 ["wmic", "cpu", "get", "Name"],
-                capture_output=True,
-                text=True,
-                timeout=10,
+                capture_output=True, text=True, timeout=10, check=False,
             )
             lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
             if len(lines) > 1:
@@ -186,20 +404,12 @@ def _cpu_brand() -> str:
 
 
 def _scan_cpu() -> CPUProfile:
-    # psutil.cpu_freq() is unavailable on macOS ARM (Apple Silicon)
-    # and some CI environments — always guard with try/except.
-    try:
-        freq = psutil.cpu_freq()
-        freq_max = freq.max if freq else 0.0
-    except (AttributeError, NotImplementedError, RuntimeError):
-        freq_max = 0.0
-
     flags = _detect_cpu_flags()
     return CPUProfile(
         brand=_cpu_brand(),
-        cores_physical=psutil.cpu_count(logical=False) or 1,
-        cores_logical=psutil.cpu_count(logical=True) or 1,
-        frequency_max_mhz=freq_max,
+        cores_physical=_cpu_count_physical(),
+        cores_logical=_cpu_count_logical(),
+        frequency_max_mhz=_cpu_freq_mhz(),
         architecture=platform.machine(),
         supports_avx=flags["avx"],
         supports_avx2=flags["avx2"],
@@ -217,9 +427,7 @@ def _ram_speed_mhz() -> int | None:
         try:
             result = subprocess.run(
                 ["dmidecode", "--type", "17"],
-                capture_output=True,
-                text=True,
-                timeout=5,
+                capture_output=True, text=True, timeout=5, check=False,
             )
             for line in result.stdout.splitlines():
                 if "Speed:" in line and "MT/s" in line:
@@ -233,9 +441,7 @@ def _ram_speed_mhz() -> int | None:
         try:
             result = subprocess.run(
                 ["system_profiler", "SPMemoryDataType", "-json"],
-                capture_output=True,
-                text=True,
-                timeout=10,
+                capture_output=True, text=True, timeout=10, check=False,
             )
             data = json.loads(result.stdout)
             items = data.get("SPMemoryDataType", [])
@@ -250,9 +456,7 @@ def _ram_speed_mhz() -> int | None:
         try:
             result = subprocess.run(
                 ["wmic", "memorychip", "get", "Speed"],
-                capture_output=True,
-                text=True,
-                timeout=10,
+                capture_output=True, text=True, timeout=10, check=False,
             )
             lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
             if len(lines) > 1 and lines[1].isdigit():
@@ -263,10 +467,11 @@ def _ram_speed_mhz() -> int | None:
 
 
 def _scan_ram() -> RAMProfile:
-    vm = psutil.virtual_memory()
+    total = _total_ram_bytes()
+    available = _available_ram_bytes()
     return RAMProfile(
-        total_gb=round(vm.total / (1024**3), 2),
-        available_gb=round(vm.available / (1024**3), 2),
+        total_gb=round(total / (1024**3), 2),
+        available_gb=round(available / (1024**3), 2),
         speed_mhz=_ram_speed_mhz(),
     )
 
@@ -284,9 +489,7 @@ def _nvidia_gpus() -> list[GPUDevice]:
                 "--query-gpu=name,memory.total,driver_version",
                 "--format=csv,noheader,nounits",
             ],
-            capture_output=True,
-            text=True,
-            timeout=10,
+            capture_output=True, text=True, timeout=10, check=False,
         )
         devices = []
         for line in result.stdout.strip().splitlines():
@@ -300,9 +503,7 @@ def _nvidia_gpus() -> list[GPUDevice]:
             try:
                 cv = subprocess.run(
                     ["nvidia-smi", "--query-gpu=cuda_version", "--format=csv,noheader"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
+                    capture_output=True, text=True, timeout=5, check=False,
                 )
                 cuda_ver = cv.stdout.strip().splitlines()[0].strip() or None
             except Exception:
@@ -328,7 +529,7 @@ def _amd_gpus() -> list[GPUDevice]:
     rocm_ver = None
     if shutil.which("rocminfo"):
         try:
-            r = subprocess.run(["rocminfo"], capture_output=True, text=True, timeout=10)
+            r = subprocess.run(["rocminfo"], capture_output=True, text=True, timeout=10, check=False)
             for line in r.stdout.splitlines():
                 if "ROCm" in line:
                     rocm_ver = line.strip()
@@ -341,9 +542,7 @@ def _amd_gpus() -> list[GPUDevice]:
         try:
             r = subprocess.run(
                 ["rocm-smi", "--showproductname", "--json"],
-                capture_output=True,
-                text=True,
-                timeout=10,
+                capture_output=True, text=True, timeout=10, check=False,
             )
             data = json.loads(r.stdout)
             for card_id, info in data.items():
@@ -351,9 +550,7 @@ def _amd_gpus() -> list[GPUDevice]:
                 try:
                     vr = subprocess.run(
                         ["rocm-smi", "--showmeminfo", "vram", "--json"],
-                        capture_output=True,
-                        text=True,
-                        timeout=5,
+                        capture_output=True, text=True, timeout=5, check=False,
                     )
                     vdata = json.loads(vr.stdout)
                     vram_bytes = vdata.get(card_id, {}).get("VRAM Total Memory (B)", 0)
@@ -380,9 +577,7 @@ def _macos_gpus() -> list[GPUDevice]:
     try:
         result = subprocess.run(
             ["system_profiler", "SPDisplaysDataType", "-json"],
-            capture_output=True,
-            text=True,
-            timeout=10,
+            capture_output=True, text=True, timeout=10, check=False,
         )
         data = json.loads(result.stdout)
         displays = data.get("SPDisplaysDataType", [])
@@ -425,9 +620,7 @@ def _windows_gpus() -> list[GPUDevice]:
     try:
         result = subprocess.run(
             ["wmic", "path", "win32_VideoController", "get", "Name,AdapterRAM,DriverVersion", "/format:csv"],
-            capture_output=True,
-            text=True,
-            timeout=10,
+            capture_output=True, text=True, timeout=10, check=False,
         )
         devices = []
         lines = [line.strip() for line in result.stdout.splitlines() if line.strip() and "Node" not in line]
@@ -467,14 +660,11 @@ def _detect_metal_support() -> bool:
     try:
         result = subprocess.run(
             ["system_profiler", "SPDisplaysDataType", "-json"],
-            capture_output=True,
-            text=True,
-            timeout=10,
+            capture_output=True, text=True, timeout=10, check=False,
         )
         data = json.loads(result.stdout)
         for d in data.get("SPDisplaysDataType", []):
             model = d.get("sppci_model", "").lower()
-            # Metal supported on: Apple Silicon, Intel Iris/HD/UHD, AMD Radeon (2012+)
             if any(kw in model for kw in ("apple", "iris", "uhd", "hd graphics", "radeon")):
                 return True
     except Exception:
@@ -506,7 +696,7 @@ def _scan_gpus() -> list[GPUDevice]:
 
 def _scan_disk() -> DiskProfile:
     home = Path.home()
-    usage = psutil.disk_usage(str(home))
+    usage = shutil.disk_usage(str(home))
     return DiskProfile(
         free_gb=round(usage.free / (1024**3), 2),
         total_gb=round(usage.total / (1024**3), 2),
@@ -521,7 +711,7 @@ def _detect_ollama() -> tuple[bool, str | None]:
     if not shutil.which("ollama"):
         return False, None
     try:
-        r = subprocess.run(["ollama", "--version"], capture_output=True, text=True, timeout=5)
+        r = subprocess.run(["ollama", "--version"], capture_output=True, text=True, timeout=5, check=False)
         ver = r.stdout.strip() or r.stderr.strip()
         return True, ver
     except Exception:

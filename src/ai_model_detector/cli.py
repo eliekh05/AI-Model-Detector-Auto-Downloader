@@ -1,5 +1,5 @@
 """
-cli.py — Command-line interface for AI Model Detector & Auto Downloader.
+cli.py — Command-line interface (stdlib only, zero dependencies).
 
 Usage:
     ai-model-detector                      # full scan + recommend + optional install
@@ -17,11 +17,8 @@ import logging
 import sys
 from pathlib import Path
 
-from rich.prompt import Confirm, Prompt
-
 from . import __version__
 from .display import (
-    console,
     print_banner,
     print_download_result,
     print_recommendations,
@@ -34,6 +31,35 @@ from .scanner import scan_system
 from .scorer import EvaluatedModel, RAMFit, partition_recommendations, rank_models, select_install_candidate
 
 logger = logging.getLogger(__name__)
+
+
+# ── Simple input helpers (replace rich.prompt) ──────────────────────────
+
+
+def _confirm(prompt: str, default: bool = False) -> bool:
+    """Ask a y/n question. Returns True for yes, False for no."""
+    suffix = " [Y/n]" if default else " [y/N]"
+    try:
+        answer = input(f"{prompt}{suffix} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return default
+    if not answer:
+        return default
+    return answer in ("y", "yes")
+
+
+def _prompt_choice(prompt: str, choices: list[str], default: str = "") -> str:
+    """Ask user to pick from a list of choices."""
+    choice_str = "/".join(choices)
+    try:
+        answer = input(f"{prompt} ({choice_str}) [{default}]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return default
+    if not answer:
+        return default
+    if answer in choices:
+        return answer
+    return default
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -84,7 +110,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-hf",
         action="store_true",
-        help="Skip Hugging Face supplemental model data.",
+        help="Skip Hugging Face supplemental data.",
     )
     parser.add_argument(
         "--verbose",
@@ -98,12 +124,28 @@ def _build_parser() -> argparse.ArgumentParser:
 def _confirm_and_pull(target: str) -> None:
     """Always require confirmation before downloading."""
     start_ollama_serve()
-    console.print(f"\n[cyan]Pulling {target}…[/]  (this may take a while)\n")
+    print(f"\n{_ansi('cyan')}Pulling {target}…{_ansi('reset')}  (this may take a while)\n")
     result, msg = pull_model(
         target,
-        on_output=lambda line: console.print(f"  [dim]{line}[/]"),
+        on_output=lambda line: print(f"  {_ansi('dim')}{line}{_ansi('reset')}"),
     )
     print_download_result(result, msg)
+
+
+def _ansi(code: str) -> str:
+    """Return ANSI escape code if TTY, empty string otherwise."""
+    if not (hasattr(sys.stdout, "isatty") and sys.stdout.isatty()):
+        return ""
+    codes = {
+        "reset": "\033[0m",
+        "dim": "\033[2m",
+        "bold": "\033[1m",
+        "cyan": "\033[36m",
+        "green": "\033[32m",
+        "yellow": "\033[33m",
+        "red": "\033[31m",
+    }
+    return codes.get(code, "")
 
 
 def _interactive_install(ranked, top_n: int, available_ram_gb: float = 0.0) -> None:
@@ -115,9 +157,9 @@ def _interactive_install(ranked, top_n: int, available_ram_gb: float = 0.0) -> N
     - Never download without confirmation.
     """
     if not sys.stdin.isatty():
-        console.print(
-            "\n[dim]Non-interactive session — skipping download prompts. "
-            "Re-run in a terminal to install.[/]"
+        print(
+            f"\n{_ansi('dim')}Non-interactive session — skipping download prompts. "
+            f"Re-run in a terminal to install.{_ansi('reset')}"
         )
         return
 
@@ -125,11 +167,11 @@ def _interactive_install(ranked, top_n: int, available_ram_gb: float = 0.0) -> N
     recommended, potential, partition_advisory = partition_recommendations(ranked)
     recommended_tags = {sm.model.full_tag for sm in recommended}
 
-    console.print()
+    print()
     if not recommended:
-        console.print(f"[yellow]{partition_advisory or advisory}[/]")
+        print(f"{_ansi('yellow')}{partition_advisory or advisory}{_ansi('reset')}")
     elif advisory:
-        console.print(f"[yellow]{advisory}[/]")
+        print(f"{_ansi('yellow')}{advisory}{_ansi('reset')}")
 
     def _shortfall_line(sm: EvaluatedModel) -> str:
         """Format a shortfall/fit line for override prompts."""
@@ -138,15 +180,21 @@ def _interactive_install(ranked, top_n: int, available_ram_gb: float = 0.0) -> N
         avail = available_ram_gb
         shortfall = sm.estimated_total_ram_gb - avail
         if shortfall > 0:
-            return f"  [dim]Estimated {shortfall:.1f} GB shortfall ({sm.estimated_total_ram_gb:.1f} GB needed, {avail:.1f} GB available). Metadata confidence: {sm.memory_confidence.value}.[/]"
-        return f"  [dim]Estimated {abs(shortfall):.1f} GB headroom ({sm.estimated_total_ram_gb:.1f} GB needed, {avail:.1f} GB available). Metadata confidence: {sm.memory_confidence.value}.[/]"
+            return (f"  {_ansi('dim')}Estimated {shortfall:.1f} GB shortfall "
+                    f"({sm.estimated_total_ram_gb:.1f} GB needed, {avail:.1f} GB available). "
+                    f"Metadata confidence: {sm.memory_confidence.value}.{_ansi('reset')}")
+        return (f"  {_ansi('dim')}Estimated {abs(shortfall):.1f} GB headroom "
+                f"({sm.estimated_total_ram_gb:.1f} GB needed, {avail:.1f} GB available). "
+                f"Metadata confidence: {sm.memory_confidence.value}.{_ansi('reset')}")
 
     if default is not None:
         fit_note = default.ram_fit.value
         if default.ram_fit == RAMFit.RISKY:
             fit_note += ", may need freeing RAM"
-        if Confirm.ask(
-            f"[bold]Install recommended[/] [cyan]{default.model.full_tag}[/] ({fit_note}, verified) via `ollama pull`?"
+        if _confirm(
+            f"{_ansi('bold')}Install recommended{_ansi('reset')} "
+            f"{_ansi('cyan')}{default.model.full_tag}{_ansi('reset')} "
+            f"({fit_note}, verified) via `ollama pull`?"
         ):
             _confirm_and_pull(default.model.full_tag)
             return
@@ -154,30 +202,32 @@ def _interactive_install(ranked, top_n: int, available_ram_gb: float = 0.0) -> N
         # User declined the safer default — optionally offer override
         if risky_top is not None and risky_top.model.full_tag != default.model.full_tag:
             shortfall_line = _shortfall_line(risky_top)
-            if Confirm.ask(
-                f"[bold red]Override[/] and install "
-                f"[cyan]{risky_top.model.full_tag}[/] ({risky_top.ram_fit.value}) anyway?\n"
-                f"  [dim]This model is not a verified fit. It may be slow, unstable, "
-                f"or fail to load.[/]\n{shortfall_line}",
+            if _confirm(
+                f"{_ansi('red')}{_ansi('bold')}Override{_ansi('reset')} and install "
+                f"{_ansi('cyan')}{risky_top.model.full_tag}{_ansi('reset')} "
+                f"({risky_top.ram_fit.value}) anyway?\n"
+                f"  {_ansi('dim')}This model is not a verified fit. It may be slow, unstable, "
+                f"or fail to load.{_ansi('reset')}\n{shortfall_line}",
                 default=False,
             ):
                 _confirm_and_pull(risky_top.model.full_tag)
                 return
     elif risky_top is not None:
         shortfall_line = _shortfall_line(risky_top)
-        if Confirm.ask(
-            f"[bold red]Override[/] and install "
-            f"[cyan]{risky_top.model.full_tag}[/] ({risky_top.ram_fit.value}) anyway?\n"
-            f"  [dim]No verified fit found. This model may be slow, unstable, "
-            f"or fail to load.[/]\n{shortfall_line}",
+        if _confirm(
+            f"{_ansi('red')}{_ansi('bold')}Override{_ansi('reset')} and install "
+            f"{_ansi('cyan')}{risky_top.model.full_tag}{_ansi('reset')} "
+            f"({risky_top.ram_fit.value}) anyway?\n"
+            f"  {_ansi('dim')}No verified fit found. This model may be slow, unstable, "
+            f"or fail to load.{_ansi('reset')}\n{shortfall_line}",
             default=False,
         ):
             _confirm_and_pull(risky_top.model.full_tag)
             return
     else:
-        console.print(
-            "[yellow]All top recommendations require manual download — "
-            "no Ollama-library models found in the live registry right now.[/]"
+        print(
+            f"{_ansi('yellow')}All top recommendations require manual download — "
+            f"no Ollama-library models found in the live registry right now.{_ansi('reset')}"
         )
         return
 
@@ -193,7 +243,7 @@ def _interactive_install(ranked, top_n: int, available_ram_gb: float = 0.0) -> N
         ordered_pullable = pullable_no_over[:top_n]
 
     pullable_choices = {str(i + 1): sm for i, sm in enumerate(ordered_pullable[:top_n])}
-    console.print("\n[dim]Ollama-installable options (DOES_NOT_FIT models excluded):[/]")
+    print(f"\n{_ansi('dim')}Ollama-installable options (DOES_NOT_FIT models excluded):{_ansi('reset')}")
     for k, sm in pullable_choices.items():
         flag = "verified" if sm.verified else "UNVERIFIED"
         section = "recommended" if sm.model.full_tag in recommended_tags else "potential"
@@ -203,12 +253,12 @@ def _interactive_install(ranked, top_n: int, available_ram_gb: float = 0.0) -> N
             shortfall = sm.estimated_total_ram_gb - available_ram_gb
             if shortfall > 0:
                 ram_note = f" ⚠ ~{shortfall:.1f} GB shortfall"
-        console.print(
+        print(
             f"  [{k}] {sm.model.full_tag}  ({sm.ram_fit.value}, {flag}, {section}; {labels}){ram_note}"
         )
-    console.print("  [s] Skip / exit\n")
+    print(f"  [s] Skip / exit\n")
 
-    choice = Prompt.ask(
+    choice = _prompt_choice(
         "Enter number to install, or 's' to skip",
         choices=[*pullable_choices.keys(), "s"],
         default="s",
@@ -223,17 +273,19 @@ def _interactive_install(ranked, top_n: int, available_ram_gb: float = 0.0) -> N
     )
     if needs_override:
         shortfall_line = _shortfall_line(chosen)
-        if not Confirm.ask(
-            f"[bold red]Confirm override[/] for {chosen.model.full_tag} ({chosen.ram_fit.value})?\n"
-            f"  [dim]This model is not a verified fit. It may be slow, unstable, or fail to load.[/]\n"
+        if not _confirm(
+            f"{_ansi('red')}{_ansi('bold')}Confirm override{_ansi('reset')} "
+            f"for {chosen.model.full_tag} ({chosen.ram_fit.value})?\n"
+            f"  {_ansi('dim')}This model is not a verified fit. It may be slow, unstable, "
+            f"or fail to load.{_ansi('reset')}\n"
             f"{shortfall_line}",
             default=False,
         ):
-            console.print("[dim]Skipped.[/]")
+            print(f"{_ansi('dim')}Skipped.{_ansi('reset')}")
             return
 
-    if Confirm.ask(
-        f"Install [cyan]{chosen.model.full_tag}[/] via `ollama pull`?",
+    if _confirm(
+        f"Install {_ansi('cyan')}{chosen.model.full_tag}{_ansi('reset')} via `ollama pull`?",
         default=False,
     ):
         _confirm_and_pull(chosen.model.full_tag)
@@ -254,20 +306,20 @@ def run() -> None:
     if args.installed:
         models = list_installed_models()
         if models:
-            console.print("\n[bold cyan]Installed Ollama models:[/]")
+            print(f"\n{_ansi('bold')}{_ansi('cyan')}Installed Ollama models:{_ansi('reset')}")
             for m in models:
-                console.print(f"  • {m}")
+                print(f"  • {m}")
         else:
-            console.print("[yellow]No Ollama models found (or Ollama not installed).[/]")
+            print(f"{_ansi('yellow')}No Ollama models found (or Ollama not installed).{_ansi('reset')}")
         return
 
     # ── --pull ───────────────────────────────────────────────────────────────
     if args.pull:
-        console.print(f"\nPulling [cyan]{args.pull}[/]…\n")
+        print(f"\nPulling {_ansi('cyan')}{args.pull}{_ansi('reset')}…\n")
         start_ollama_serve()
         result, msg = pull_model(
             args.pull,
-            on_output=lambda line: console.print(f"  {line}"),
+            on_output=lambda line: print(f"  {line}"),
         )
         print_download_result(result, msg)
         return
@@ -276,26 +328,23 @@ def run() -> None:
     spx_path = Path(args.spx_file) if args.spx_file else None
     scan_label = f"Importing {spx_path.name}" if spx_path else "Scanning system hardware"
 
-    with spinner(scan_label) as prog:
-        prog.add_task("", total=None)
+    with spinner(scan_label):
         profile = scan_system(spx_path=spx_path)
 
     print_system_profile(profile)
 
     # ── Fetch live registry ───────────────────────────────────────────────────
-    with spinner("Fetching live model registry from Ollama & HuggingFace…") as prog:
-        prog.add_task("", total=None)
+    with spinner("Fetching live model registry from Ollama & HuggingFace…"):
         registry = fetch_registry(include_hf=not args.no_hf)
 
     if not registry:
-        console.print("[yellow]Could not fetch model registry. Check your internet connection and try again.[/]")
+        print(f"{_ansi('yellow')}Could not fetch model registry. Check your internet connection and try again.{_ansi('reset')}")
         sys.exit(1)
 
-    console.print(f"\n[dim]Registry loaded: {len(registry)} model variants from live sources[/]")
+    print(f"\n{_ansi('dim')}Registry loaded: {len(registry)} model variants from live sources{_ansi('reset')}")
 
     # ── Evaluate & recommend ─────────────────────────────────────────────────
-    with spinner("Evaluating models against your hardware…") as prog:
-        prog.add_task("", total=None)
+    with spinner("Evaluating models against your hardware…"):
         ranked = rank_models(
             registry,
             profile,
@@ -304,7 +353,7 @@ def run() -> None:
         )
 
     if not ranked:
-        console.print("[yellow]No models matched your filters and hardware constraints.[/]")
+        print(f"{_ansi('yellow')}No models matched your filters and hardware constraints.{_ansi('reset')}")
         sys.exit(1)
 
     # ── JSON output ───────────────────────────────────────────────────────────
@@ -357,7 +406,7 @@ def run() -> None:
     # ── Interactive download ──────────────────────────────────────────────────
     _interactive_install(ranked, args.top, available_ram_gb=profile.ram.available_gb)
 
-    console.print("\n[dim]Done. Run [cyan]ollama run <model>[/] to use an installed model.[/]\n")
+    print(f"\n{_ansi('dim')}Done. Run {_ansi('cyan')}ollama run <model>{_ansi('reset')}{_ansi('dim')} to use an installed model.{_ansi('reset')}\n")
 
 
 if __name__ == "__main__":

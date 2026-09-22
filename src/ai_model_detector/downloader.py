@@ -18,7 +18,7 @@ from enum import Enum
 logger = logging.getLogger(__name__)
 
 # Strip ANSI escape sequences (colour codes, cursor-movement codes, etc.)
-# ollama's progress bar uses these heavily and they corrupt Rich panels.
+# ollama's progress bar uses these heavily.
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\r")
 
 

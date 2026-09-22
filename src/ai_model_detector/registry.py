@@ -1,5 +1,5 @@
 """
-registry.py — Live AI model registry fetcher.
+registry.py — Live AI model registry fetcher (stdlib only, zero dependencies).
 
 Queries Ollama's public library, Hugging Face API, and community
 sources at runtime to build a fresh model list. Nothing is hardcoded —
@@ -9,24 +9,24 @@ the registry is always fetched fresh so new models appear automatically.
 import json
 import logging
 import re
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
-
-import requests
 
 logger = logging.getLogger(__name__)
 
 OLLAMA_LIBRARY_URL = "https://ollama.com/library"
 OLLAMA_API_SHOW_URL = "https://ollama.com/api/show"
 OLLAMA_SEARCH_URL = "https://ollama.com/search"
-OLLAMA_MODEL_API = "https://ollama.com/api/models"  # undocumented but returns tag lists
+OLLAMA_MODEL_API = "https://ollama.com/api/models"
 
 HF_API_URL = "https://huggingface.co/api/models"
 
-# Community issue trackers (Reddit / GitHub) parsed via simple JSON API
 GITHUB_ISSUES_URL = "https://api.github.com/repos/ollama/ollama/issues?state=open&labels=bug&per_page=20"
 
 REQUEST_TIMEOUT = 15
-USER_AGENT = "AI-Model-Detector/1.0 (https://github.com/eliekh05/AI-Model-Detector-Auto-Downloader)"
+USER_AGENT = "AI-Model-Detector/2.0 (https://github.com/eliekh05/AI-Model-Detector-Auto-Downloader)"
 
 
 # Canonical task categories. Never invent "chat" merely because a file is GGUF.
@@ -113,13 +113,15 @@ class ModelInfo:
 # ── helpers ───────────────────────────────────────────────────────────
 
 
-def _http_get(url: str, params: dict | None = None, timeout: int = REQUEST_TIMEOUT) -> requests.Response | None:
+def _http_get(url: str, params: dict | None = None, timeout: int = REQUEST_TIMEOUT) -> str | None:
+    """Fetch URL with urllib.request. Returns response text or None on failure."""
     try:
-        headers = {"User-Agent": USER_AGENT}
-        resp = requests.get(url, params=params, headers=headers, timeout=timeout)
-        resp.raise_for_status()
-        return resp
-    except requests.RequestException as exc:
+        if params:
+            url = url + "?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError) as exc:
         logger.warning("HTTP request failed: %s — %s", url, exc)
         return None
 
@@ -144,7 +146,6 @@ def _parse_size_to_gb(size_str: str) -> float:
 
 def _ram_from_size(size_gb: float, has_gpu: bool) -> tuple[float, float]:
     """Estimate RAM / VRAM needed given model size."""
-    # Typical rule: model size × 1.2 for RAM overhead, full size for VRAM
     ram = round(size_gb * 1.25, 1)
     vram = round(size_gb * 1.1, 1) if has_gpu else 0.0
     return ram, vram
@@ -162,14 +163,11 @@ def _fetch_ollama_library() -> list[ModelInfo]:
     models: list[ModelInfo] = []
 
     # ── Step 1: get slug list ─────────────────────────────────────────────────
-    resp = _http_get(OLLAMA_SEARCH_URL, params={"q": "", "c": "", "o": "popular"})
-    if resp is None:
+    html = _http_get(OLLAMA_SEARCH_URL, params={"q": "", "c": "", "o": "popular"})
+    if html is None:
         logger.warning("Could not reach Ollama search endpoint")
         return []
 
-    html = resp.text
-
-    # Extract model slugs from href="/library/<slug>"
     slugs: list[str] = []
     seen_slugs: set[str] = set()
     for m in re.finditer(r'href="/library/([a-zA-Z0-9_.-]+)"', html):
@@ -199,12 +197,12 @@ def _fetch_ollama_library() -> list[ModelInfo]:
 
     # ── Step 2: fetch real tags for each model ────────────────────────────────
     for slug in slugs[:60]:  # cap at 60 to avoid hammering the server
-        model_page = _http_get(f"https://ollama.com/library/{slug}/tags")
-        if model_page is None:
-            # Fallback: try to at least get the model page without /tags
-            model_page = _http_get(f"https://ollama.com/library/{slug}")
+        page_html = _http_get(f"https://ollama.com/library/{slug}/tags")
+        if page_html is None:
+            page_html = _http_get(f"https://ollama.com/library/{slug}")
 
-        page_html = model_page.text if model_page else ""
+        if page_html is None:
+            page_html = ""
         description = ""
         pull_count = 0
 
@@ -233,8 +231,6 @@ def _fetch_ollama_library() -> list[ModelInfo]:
             except ValueError:
                 pass
 
-        # Extract real tags from the tags page
-        # Pattern: <span ...>tagname</span> or href="/library/slug:tagname"
         tag_entries: list[tuple[str, float]] = []  # (tag_name, size_gb)
 
         # href pattern: /library/slug:tag
@@ -246,8 +242,7 @@ def _fetch_ollama_library() -> list[ModelInfo]:
             if tag_name and tag_name not in {t for t, _ in tag_entries}:
                 tag_entries.append((tag_name, 0.0))
 
-        # Size pattern near each tag: look for "X.XGB" or "X.X GB" near tag refs
-        # Try to extract size from the tags listing table
+        # Size pattern near each tag
         size_blocks = re.findall(
             r"([a-zA-Z0-9_.\-]+)\s*[^<]*?([\d.]+\s*(?:GB|MB))",
             page_html,
@@ -258,14 +253,12 @@ def _fetch_ollama_library() -> list[ModelInfo]:
             if gb > 0 and len(tag_candidate) <= 30:
                 size_map[tag_candidate] = gb
 
-        # If no tags found from href pattern, try looking for tag name spans
         if not tag_entries:
             for tm in re.finditer(
                 r"<(?:span|code|td)[^>]*>\s*([a-zA-Z0-9][a-zA-Z0-9_.\-]{0,25})\s*</(?:span|code|td)>",
                 page_html,
             ):
                 candidate = tm.group(1)
-                # Filter: must look like a valid Ollama tag
                 if (
                     re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_.\-]*$", candidate)
                     and candidate != slug
@@ -273,14 +266,11 @@ def _fetch_ollama_library() -> list[ModelInfo]:
                 ):
                     tag_entries.append((candidate, size_map.get(candidate, 0.0)))
 
-        # Update sizes from size_map
         tag_entries = [(tag, size_map.get(tag, size)) for tag, size in tag_entries]
 
         categories, category_source = infer_task_categories(slug, description)
 
         if not tag_entries:
-            # We know this model exists but couldn't parse its tags —
-            # skip it rather than emitting a fake :latest that won't pull
             logger.debug("No tags found for %s — skipping", slug)
             continue
 
@@ -323,9 +313,6 @@ def infer_task_categories(
       - "metadata" — Hugging Face pipeline_tag / explicit tags
       - "inferred" — name or description heuristics
       - "unknown"  — insufficient evidence (never invent "chat" for GGUF alone)
-
-    Supported categories: asr, audio, chat, coding, reasoning, embeddings,
-    vision, translation, multimodal, unknown.
     """
     tags = tags or []
     found: list[str] = []
@@ -368,7 +355,6 @@ def infer_task_categories(
 
     # ── 3. Name / description heuristics (weaker) ───────────────────────────
     text = f"{name} {description}".lower()
-    # Strip format-only tokens so "gguf" never implies chat
     text_for_task = re.sub(r"\b(gguf|ggml|safetensors|bin|q\d[_k0-9]*|f16|f32|bf16)\b", " ", text)
 
     inferred: list[str] = []
@@ -395,7 +381,6 @@ def infer_task_categories(
         and not inferred
         and any(kw in text_for_task for kw in ("speech", "sound", "voice", "waveform"))
     ):
-        # Generic "audio" without ASR/TTS cues — keep as audio, not chat
         inferred.append("audio")
     if any(kw in text_for_task for kw in ("translat", "nllb", "marianmt", "opus-mt")):
         inferred.append("translation")
@@ -424,7 +409,6 @@ def infer_task_categories(
         for kw in ("reasoning", "mathstral", "qwen2-math", "deepseek-r1", "qwq")
     ) or re.search(r"(?<![a-z])math(?![a-z])", text_for_task):
         inferred.append("reasoning")
-    # Chat only with explicit conversational cues — never the silent default
     if any(
         kw in text_for_task
         for kw in (
@@ -457,12 +441,6 @@ def infer_task_categories(
     return found, source
 
 
-# Backward-compatible wrapper used by older call sites / tests
-def _infer_categories(name: str, description: str) -> list[str]:
-    cats, _ = infer_task_categories(name, description)
-    return cats
-
-
 def _infer_quantization(tag: str) -> str:
     tag_lower = tag.lower()
     for quant in [
@@ -484,7 +462,6 @@ def _infer_quantization(tag: str) -> str:
     ]:
         if quant in tag_lower:
             return quant
-    # Numeric size hints
     if re.search(r"\d+b", tag_lower):
         return "q4_0"  # Ollama default quantization
     return "unknown"
@@ -502,13 +479,13 @@ def _fetch_hf_popular_models(limit: int = 30) -> list[ModelInfo]:
         "limit": limit,
         "full": True,
     }
-    resp = _http_get(HF_API_URL, params=params)
-    if resp is None:
+    text = _http_get(HF_API_URL, params=params)
+    if text is None:
         return []
 
     models = []
     try:
-        data = resp.json()
+        data = json.loads(text)
         for item in data:
             model_id = item.get("modelId", "") or item.get("id", "")
             downloads = item.get("downloads", 0)
@@ -560,16 +537,15 @@ def _fetch_known_issues() -> dict[str, list[str]]:
     Returns a dict mapping model name keywords to issue titles.
     """
     issues: dict[str, list[str]] = {}
-    resp = _http_get(GITHUB_ISSUES_URL)
-    if resp is None:
+    text = _http_get(GITHUB_ISSUES_URL)
+    if text is None:
         return issues
 
     try:
-        data = resp.json()
+        data = json.loads(text)
         for issue in data:
             title = issue.get("title", "")
             body = issue.get("body", "") or ""
-            # Look for model names mentioned in the issue
             for word in re.findall(r"\b[a-z][a-z0-9._-]+\b", (title + " " + body).lower()):
                 if len(word) > 3 and word not in {"with", "from", "when", "this", "that", "have"}:
                     issues.setdefault(word, []).append(title[:120])
@@ -588,10 +564,10 @@ def _fetch_local_ollama_models() -> list[ModelInfo]:
     These are guaranteed pullable and have accurate size data.
     """
     try:
-        resp = _http_get("http://localhost:11434/api/tags", timeout=3)
-        if resp is None:
+        text = _http_get("http://localhost:11434/api/tags", timeout=3)
+        if text is None:
             return []
-        data = resp.json()
+        data = json.loads(text)
         models = []
         for item in data.get("models", []):
             full = item.get("name", "")
@@ -635,11 +611,9 @@ def fetch_registry(include_hf: bool = True) -> list[ModelInfo]:
     ollama_models = _fetch_ollama_library()
     logger.info("Found %d Ollama model variants", len(ollama_models))
 
-    # Supplement with locally installed models (guaranteed correct tags + sizes)
     local_models = _fetch_local_ollama_models()
     logger.info("Found %d locally installed models", len(local_models))
 
-    # Merge: local models take precedence over scraped ones for same full_tag
     local_tags = {m.full_tag for m in local_models}
     ollama_models = [m for m in ollama_models if m.full_tag not in local_tags]
     ollama_models = local_models + ollama_models
@@ -653,7 +627,6 @@ def fetch_registry(include_hf: bool = True) -> list[ModelInfo]:
     known_issues = _fetch_known_issues()
     logger.info("Loaded %d known issue keywords", len(known_issues))
 
-    # Attach known issues to models
     all_models = ollama_models + hf_models
     for m in all_models:
         matched = []
@@ -662,9 +635,6 @@ def fetch_registry(include_hf: bool = True) -> list[ModelInfo]:
                 matched.extend(titles[:2])
         m.known_issues = matched[:4]
 
-    # Sort: Ollama-pullable first, then by popularity desc.
-    # Within Ollama models, prefer ones with known sizes (size_gb > 0) so the
-    # evaluator can classify hardware fit rather than leaving everything UNKNOWN.
     all_models.sort(
         key=lambda m: (
             int(m.ollama_pullable),

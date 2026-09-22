@@ -23,11 +23,7 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
-dependencies = [
-    "psutil>=5.9",
-    "requests>=2.31",
-    "rich>=11.0",
-]
+dependencies = []
 
 [project.optional-dependencies]
 dev = [

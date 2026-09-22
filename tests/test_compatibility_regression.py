@@ -7,6 +7,7 @@ Primary profile: 8 GB Intel MacBook Pro (Iris Plus 645, ~2.4 GB available RAM).
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 import pytest
 
@@ -575,3 +576,42 @@ def test_unknown_never_treated_as_fits(intel_8gb):
     assert not sm.fits_ram  # FITS property must be False for UNKNOWN
     assert sm.ram_fit != RAMFit.FITS
     assert sm.ram_fit != RAMFit.TIGHT
+
+
+# ── 2.0.0 specific tests ──────────────────────────────────────────────────
+
+
+def test_version_is_2_0_0():
+    """Version must be 2.0.0."""
+    from ai_model_detector import __version__
+    assert __version__ == "2.0.0"
+
+
+def test_no_third_party_runtime_imports():
+    """Package source files must not import any third-party runtime dependencies."""
+    forbidden = {"rich", "click", "pywhat", "psutil", "requests", "urllib3", "certifi",
+                 "idna", "charset_normalizer", "pygments", "markdown_it_py", "mdurl"}
+    src_dir = Path(__file__).resolve().parents[1] / "src" / "ai_model_detector"
+    for py_file in src_dir.glob("*.py"):
+        content = py_file.read_text()
+        for dep in forbidden:
+            assert f"import {dep}" not in content and f"from {dep}" not in content, \
+                f"{py_file.name} imports {dep}"
+
+
+def test_package_imports_without_deps():
+    """Package should import cleanly (all deps are stdlib)."""
+    import ai_model_detector
+    from ai_model_detector import scanner, registry, scorer, cli, display, downloader  # noqa: F401
+    assert ai_model_detector.__version__ == "2.0.0"
+
+
+def test_scan_system_works():
+    """Live scan should return a valid profile using stdlib only."""
+    from ai_model_detector.scanner import scan_system
+    profile = scan_system()
+    assert profile.os_name
+    assert profile.cpu.brand
+    assert profile.cpu.cores_physical >= 1
+    assert profile.ram.total_gb > 0
+    assert profile.ram.available_gb >= 0
