@@ -31,7 +31,7 @@ from .display import (
 from .downloader import list_installed_models, pull_model, start_ollama_serve
 from .registry import fetch_registry
 from .scanner import scan_system
-from .scorer import RAMFit, partition_recommendations, rank_models, select_install_candidate
+from .scorer import EvaluatedModel, RAMFit, partition_recommendations, rank_models, select_install_candidate
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +106,7 @@ def _confirm_and_pull(target: str) -> None:
     print_download_result(result, msg)
 
 
-def _interactive_install(ranked, top_n: int) -> None:
+def _interactive_install(ranked, top_n: int, available_ram_gb: float = 0.0) -> None:
     """
     Offer install with safe defaults.
 
@@ -121,19 +121,25 @@ def _interactive_install(ranked, top_n: int) -> None:
         )
         return
 
-    default, risky_top, advisory = select_install_candidate(ranked)
+    default, risky_top, advisory = select_install_candidate(ranked, available_ram_gb=available_ram_gb)
     recommended, potential, partition_advisory = partition_recommendations(ranked)
-    pullable = [sm for sm in ranked if sm.installable]
     recommended_tags = {sm.model.full_tag for sm in recommended}
-
-    # Filter out DOES_NOT_FIT models from any install offer — they will not work
-    pullable_no_over = [sm for sm in pullable if sm.ram_fit != RAMFit.OVER and not sm.disqualified]
 
     console.print()
     if not recommended:
         console.print(f"[yellow]{partition_advisory or advisory}[/]")
     elif advisory:
         console.print(f"[yellow]{advisory}[/]")
+
+    def _shortfall_line(sm: EvaluatedModel) -> str:
+        """Format a shortfall/fit line for override prompts."""
+        if sm.estimated_total_ram_gb <= 0:
+            return ""
+        avail = available_ram_gb
+        shortfall = sm.estimated_total_ram_gb - avail
+        if shortfall > 0:
+            return f"  [dim]Estimated {shortfall:.1f} GB shortfall ({sm.estimated_total_ram_gb:.1f} GB needed, {avail:.1f} GB available). Metadata confidence: {sm.memory_confidence.value}.[/]"
+        return f"  [dim]Estimated {abs(shortfall):.1f} GB headroom ({sm.estimated_total_ram_gb:.1f} GB needed, {avail:.1f} GB available). Metadata confidence: {sm.memory_confidence.value}.[/]"
 
     if default is not None:
         fit_note = default.ram_fit.value
@@ -145,41 +151,25 @@ def _interactive_install(ranked, top_n: int) -> None:
             _confirm_and_pull(default.model.full_tag)
             return
 
-        # User declined the safer default — optionally offer override for unverified top
-        # Only offer override for RISKY/UNKNOWN, never for OVER/disqualified
-        if (
-            risky_top is not None
-            and risky_top.model.full_tag != default.model.full_tag
-            and risky_top.ram_fit != RAMFit.OVER
-            and not risky_top.disqualified
-        ):
-            risk_detail = ""
-            if risky_top.estimated_total_ram_gb > 0:
-                risk_detail = (
-                    f" (est. ~{risky_top.estimated_total_ram_gb:.1f} GB needed, "
-                    f"{risky_top.ram_fit.value})"
-                )
+        # User declined the safer default — optionally offer override
+        if risky_top is not None and risky_top.model.full_tag != default.model.full_tag:
+            shortfall_line = _shortfall_line(risky_top)
             if Confirm.ask(
                 f"[bold red]Override[/] and install "
-                f"[cyan]{risky_top.model.full_tag}[/]{risk_detail} anyway?\n"
+                f"[cyan]{risky_top.model.full_tag}[/] ({risky_top.ram_fit.value}) anyway?\n"
                 f"  [dim]This model is not a verified fit. It may be slow, unstable, "
-                f"or fail to load.[/]",
+                f"or fail to load.[/]\n{shortfall_line}",
                 default=False,
             ):
                 _confirm_and_pull(risky_top.model.full_tag)
                 return
-    elif risky_top is not None and risky_top.ram_fit != RAMFit.OVER and not risky_top.disqualified:
-        risk_detail = ""
-        if risky_top.estimated_total_ram_gb > 0:
-            risk_detail = (
-                f" (est. ~{risky_top.estimated_total_ram_gb:.1f} GB needed, "
-                f"{risky_top.ram_fit.value})"
-            )
+    elif risky_top is not None:
+        shortfall_line = _shortfall_line(risky_top)
         if Confirm.ask(
             f"[bold red]Override[/] and install "
-            f"[cyan]{risky_top.model.full_tag}[/]{risk_detail} anyway?\n"
+            f"[cyan]{risky_top.model.full_tag}[/] ({risky_top.ram_fit.value}) anyway?\n"
             f"  [dim]No verified fit found. This model may be slow, unstable, "
-            f"or fail to load.[/]",
+            f"or fail to load.[/]\n{shortfall_line}",
             default=False,
         ):
             _confirm_and_pull(risky_top.model.full_tag)
@@ -192,10 +182,10 @@ def _interactive_install(ranked, top_n: int) -> None:
         return
 
     # Manual pick — only from models that aren't OVER/disqualified
+    pullable_no_over = [sm for sm in ranked if sm.installable and sm.ram_fit != RAMFit.OVER and not sm.disqualified]
     if not pullable_no_over:
         return
 
-    # Manual pick from pullable list (recommended first, then potential), filtered
     ordered_pullable = [sm for sm in recommended if sm.installable and sm.ram_fit != RAMFit.OVER and not sm.disqualified] + [
         sm for sm in potential if sm.installable and sm.ram_fit != RAMFit.OVER and not sm.disqualified
     ]
@@ -208,8 +198,13 @@ def _interactive_install(ranked, top_n: int) -> None:
         flag = "verified" if sm.verified else "UNVERIFIED"
         section = "recommended" if sm.model.full_tag in recommended_tags else "potential"
         labels = ", ".join(sm.label_names[:2]) if sm.labels else "—"
+        ram_note = ""
+        if sm.estimated_total_ram_gb > 0:
+            shortfall = sm.estimated_total_ram_gb - available_ram_gb
+            if shortfall > 0:
+                ram_note = f" ⚠ ~{shortfall:.1f} GB shortfall"
         console.print(
-            f"  [{k}] {sm.model.full_tag}  ({sm.ram_fit.value}, {flag}, {section}; {labels})"
+            f"  [{k}] {sm.model.full_tag}  ({sm.ram_fit.value}, {flag}, {section}; {labels}){ram_note}"
         )
     console.print("  [s] Skip / exit\n")
 
@@ -226,17 +221,20 @@ def _interactive_install(ranked, top_n: int) -> None:
         RAMFit.UNKNOWN,
         RAMFit.RISKY,
     )
-    if needs_override and not Confirm.ask(
-        f"[bold red]Confirm override[/] for {chosen.model.full_tag} ({chosen.ram_fit.value})?\n"
-        f"  [dim]This model is not a verified fit. It may be slow, unstable, or fail to load.[/]",
-        default=False,
-    ):
-        console.print("[dim]Skipped.[/]")
-        return
+    if needs_override:
+        shortfall_line = _shortfall_line(chosen)
+        if not Confirm.ask(
+            f"[bold red]Confirm override[/] for {chosen.model.full_tag} ({chosen.ram_fit.value})?\n"
+            f"  [dim]This model is not a verified fit. It may be slow, unstable, or fail to load.[/]\n"
+            f"{shortfall_line}",
+            default=False,
+        ):
+            console.print("[dim]Skipped.[/]")
+            return
 
     if Confirm.ask(
         f"Install [cyan]{chosen.model.full_tag}[/] via `ollama pull`?",
-        default=True,
+        default=False,
     ):
         _confirm_and_pull(chosen.model.full_tag)
 
@@ -357,7 +355,7 @@ def run() -> None:
     )
 
     # ── Interactive download ──────────────────────────────────────────────────
-    _interactive_install(ranked, args.top)
+    _interactive_install(ranked, args.top, available_ram_gb=profile.ram.available_gb)
 
     console.print("\n[dim]Done. Run [cyan]ollama run <model>[/] to use an installed model.[/]\n")
 

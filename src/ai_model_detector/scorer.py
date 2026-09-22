@@ -569,9 +569,15 @@ def evaluate_model(model: ModelInfo, profile: SystemProfile) -> EvaluatedModel:
     else:
         warnings.append("HuggingFace-only — cannot install via `ollama pull`.")
 
-    # ── Runtime compatibility (conservative: Ollama GGUF runs on CPU everywhere) ─
+    # ── Runtime compatibility (theoretical: format is GGUF which backends support) ─
     runtime_compatible = True
-    explanation.append("Runtime: treated as CPU-capable via Ollama/llama.cpp-class backends.")
+    if installable:
+        explanation.append("Runtime: Ollama/llama.cpp-class backend supports GGUF format.")
+    else:
+        explanation.append(
+            "Runtime: GGUF format is theoretically supported by llama.cpp-class backends, "
+            "but this model is not installed and has not been verified to run."
+        )
 
     # ── Disk ────────────────────────────────────────────────────────────────
     if model.size_gb > 0:
@@ -1014,6 +1020,7 @@ _NO_VERIFIED_FIT_MSG = (
 
 def select_install_candidate(
     ranked: list[EvaluatedModel],
+    available_ram_gb: float = 0.0,
 ) -> tuple[EvaluatedModel | None, EvaluatedModel | None, str]:
     """
     Choose the default install candidate.
@@ -1023,16 +1030,24 @@ def select_install_candidate(
 
     Preference:
       1. Verified FITS/TIGHT only as automatic default
-      2. Otherwise no default — RISKY/UNKNOWN/OVER require explicit override
+      2. Otherwise no default — RISKY/UNKNOWN require explicit override
+      3. OVER/disqualified models are never offered for install
 
     Unknown-size / UNVERIFIED models are never the silent default.
+    Models whose estimated RAM exceeds available RAM are flagged but may
+    still appear as override candidates (user must explicitly confirm).
     """
     pullable = [sm for sm in ranked if sm.installable]
     if not pullable:
         return None, None, "No Ollama-pullable models in the recommendation list."
 
-    top = pullable[0]
-    safe = next((sm for sm in pullable if sm.is_safe_install_default), None)
+    # Exclude OVER/disqualified from all install paths
+    installable_fit = [sm for sm in pullable if sm.ram_fit != RAMFit.OVER and not sm.disqualified]
+    if not installable_fit:
+        return None, None, "All pullable models exceed installed RAM — no install candidates."
+
+    top = installable_fit[0]
+    safe = next((sm for sm in installable_fit if sm.is_safe_install_default), None)
 
     if safe is not None:
         return (
@@ -1045,23 +1060,40 @@ def select_install_candidate(
         )
 
     # No verified FITS/TIGHT — disable automatic install.
-    # Only offer override for RISKY/UNKNOWN, never for OVER/disqualified.
-    override = top
+    # Prefer override candidates where estimated RAM ≤ available RAM.
+    def _ram_shortfall(sm: EvaluatedModel) -> float | None:
+        """Return estimated shortfall vs available RAM, or None if unknown."""
+        if sm.estimated_total_ram_gb > 0 and available_ram_gb > 0:
+            return round(sm.estimated_total_ram_gb - available_ram_gb, 2)
+        return None
+
     risky = next(
-        (sm for sm in pullable if sm.verified and sm.ram_fit == RAMFit.RISKY and not sm.disqualified),
+        (sm for sm in installable_fit if sm.verified and sm.ram_fit == RAMFit.RISKY),
         None,
     )
     if risky is not None:
-        override = risky
+        shortfall = _ram_shortfall(risky)
+        shortfall_str = ""
+        if shortfall is not None and shortfall > 0:
+            shortfall_str = f" — estimated {shortfall:.1f} GB shortfall vs available RAM"
+        elif shortfall is not None and shortfall <= 0:
+            shortfall_str = f" — estimated {abs(shortfall):.1f} GB headroom"
         return (
             None,
-            override,
+            risky,
             (
                 f"{_NO_VERIFIED_FIT_MSG} "
                 f"Closest verified candidate: {risky.model.full_tag} "
-                f"({risky.ram_fit.value}, est. ~{risky.estimated_total_ram_gb:.1f} GB)."
+                f"({risky.ram_fit.value}, est. ~{risky.estimated_total_ram_gb:.1f} GB)"
+                f"{shortfall_str}."
             ),
         )
+
+    # No verified RISKY either — offer top pullable as override with clear warnings
+    shortfall = _ram_shortfall(top)
+    shortfall_str = ""
+    if shortfall is not None and shortfall > 0:
+        shortfall_str = f" — estimated {shortfall:.1f} GB shortfall vs available RAM"
 
     reasons = []
     if top.unverified or top.ram_fit == RAMFit.UNKNOWN:
@@ -1072,6 +1104,6 @@ def select_install_candidate(
 
     return (
         None,
-        override,
-        f"{_NO_VERIFIED_FIT_MSG} Top-listed {top.model.full_tag} is {reason_txt}.",
+        top,
+        f"{_NO_VERIFIED_FIT_MSG} Top-listed {top.model.full_tag} is {reason_txt}{shortfall_str}.",
     )

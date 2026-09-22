@@ -66,7 +66,7 @@ def print_system_profile(profile: SystemProfile) -> None:
         or "None detected",
     )
     table.add_row("RAM Total", f"{profile.ram.total_gb:.1f} GB")
-    table.add_row("RAM Available", f"{profile.ram.available_gb:.1f} GB")
+    table.add_row("RAM Available", f"{profile.ram.available_gb:.1f} GB [dim](snapshot at scan time)[/]")
     if profile.ram.speed_mhz:
         table.add_row("RAM Speed", f"{profile.ram.speed_mhz} MHz")
 

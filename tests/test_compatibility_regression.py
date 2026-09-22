@@ -234,7 +234,7 @@ def test_unverified_top_is_not_silent_install_default(intel_8gb):
         make_model(name="tinyllama", tag="1.1b", size_gb=0.6, quantization="q4_0"),
     ]
     ranked = rank_models(models, intel_8gb, top_n=5)
-    default, _override, msg = select_install_candidate(ranked)
+    default, _override, msg = select_install_candidate(ranked, available_ram_gb=intel_8gb.ram.available_gb)
     assert default is not None
     assert default.verified
     assert default.model.full_tag == "tinyllama:1.1b"
@@ -248,7 +248,7 @@ def test_no_verified_candidate_says_so(intel_8gb):
         make_model(name="llama3.1", tag="30b", size_gb=19.0, quantization="q4_k_m"),
     ]
     ranked = rank_models(models, intel_8gb, top_n=5)
-    default, override, msg = select_install_candidate(ranked)
+    default, override, msg = select_install_candidate(ranked, available_ram_gb=intel_8gb.ram.available_gb)
     assert default is None
     assert override is not None
     assert "No verified model currently fits the available memory" in msg
@@ -270,7 +270,7 @@ def test_no_forced_recommendation_when_nothing_verified(intel_8gb):
     assert recommended == []
     assert potential
     assert advisory is not None
-    default, _, _ = select_install_candidate(ranked)
+    default, _, _ = select_install_candidate(ranked, available_ram_gb=intel_8gb.ram.available_gb)
     assert default is None
     for sm in potential:
         assert RecommendationLabel.BEST_FIT not in sm.labels
@@ -516,3 +516,62 @@ def test_potential_candidates_not_in_recommended(intel_8gb):
     for sm in recommended:
         assert sm.verified
         assert sm.ram_fit in (RAMFit.FITS, RAMFit.TIGHT)
+
+
+def test_over_models_excluded_from_install_flow(intel_8gb):
+    """Models exceeding installed RAM must never appear as install candidates."""
+    models = [
+        make_model(name="llama3.1", tag="30b", size_gb=19.0, quantization="q4_k_m"),  # OVER
+        make_model(name="gemma2", tag="9b", size_gb=5.4, quantization="q4_k_m"),  # RISKY/OVER
+    ]
+    ranked = rank_models(models, intel_8gb, top_n=5)
+    default, override, _msg = select_install_candidate(ranked, available_ram_gb=intel_8gb.ram.available_gb)
+    assert default is None
+    # Override should not be OVER model
+    if override is not None:
+        assert override.ram_fit != RAMFit.OVER
+        assert not override.disqualified
+
+
+def test_install_candidate_shows_shortfall(intel_8gb):
+    """Override candidate advisory should include shortfall info when estimated RAM > available."""
+    # Tiny model with known size that FITS
+    models = [
+        make_model(name="tinyllama", tag="1.1b", size_gb=0.6, quantization="q4_0"),
+        make_model(name="granite3.3", tag="3b", size_gb=2.0, quantization="q4_k_m"),  # RISKY
+    ]
+    ranked = rank_models(models, intel_8gb, top_n=5)
+    default, _override, _msg = select_install_candidate(ranked, available_ram_gb=intel_8gb.ram.available_gb)
+    # Should have a verified default (tinyllama)
+    assert default is not None
+    assert default.verified
+
+
+def test_hf_only_runtime_compatible_is_theoretical(intel_8gb):
+    """HF-only models should not claim 'Runtime compatible: yes' without qualification."""
+    hf_model = make_model(
+        name="some-org/gguf-model",
+        tag="latest",
+        size_gb=0.0,
+        quantization="gguf",
+        ollama_pullable=False,
+    )
+    sm = evaluate_model(hf_model, intel_8gb)
+    assert sm.installable is False
+    # runtime_compatible is True (format compatible) but explanation should qualify it
+    assert sm.runtime_compatible is True
+    assert any("theoretically" in e.lower() or "not installed" in e.lower() or "not been verified" in e.lower()
+               for e in sm.explanation)
+
+
+def test_unknown_never_treated_as_fits(intel_8gb):
+    """UNKNOWN memory fit must never become FITS, even when estimated RAM seems low."""
+    sm = evaluate_model(
+        make_model(name="mystery-small", tag="0.5b"),  # no size_gb → UNKNOWN
+        intel_8gb,
+    )
+    assert sm.ram_fit == RAMFit.UNKNOWN
+    assert not sm.verified
+    assert not sm.fits_ram  # FITS property must be False for UNKNOWN
+    assert sm.ram_fit != RAMFit.FITS
+    assert sm.ram_fit != RAMFit.TIGHT
