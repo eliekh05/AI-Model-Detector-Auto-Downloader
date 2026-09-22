@@ -390,10 +390,13 @@ def infer_task_categories(
         inferred.append("asr")
     if any(kw in text_for_task for kw in ("text-to-speech", "tts", "audio generation", "voice clone")) and "asr" not in inferred:
         inferred.append("audio")
-    elif "audio" in text_for_task and not inferred:
+    elif (
+        "audio" in text_for_task
+        and not inferred
+        and any(kw in text_for_task for kw in ("speech", "sound", "voice", "waveform"))
+    ):
         # Generic "audio" without ASR/TTS cues — keep as audio, not chat
-        if any(kw in text_for_task for kw in ("speech", "sound", "voice", "waveform")):
-            inferred.append("audio")
+        inferred.append("audio")
     if any(kw in text_for_task for kw in ("translat", "nllb", "marianmt", "opus-mt")):
         inferred.append("translation")
     if any(
