@@ -51,7 +51,6 @@ class AccelerationStatus(Enum):
     CUDA = "cuda"
     ROCM = "rocm"
     METAL_APPLE = "metal_apple"  # Apple Silicon — Metal established
-    METAL_INTEL = "metal_intel"  # Intel Mac with Metal-capable GPU — possible but unverified
     CPU_ONLY = "cpu_only"
     UNVERIFIED = "unverified"  # GPU present but backend use not established
 
@@ -367,7 +366,13 @@ def acceleration_for_tier(
     os_arch: str = "",
     metal_available: bool = False,
 ) -> AccelerationStatus:
-    """Map detection tier → whether LLM acceleration is actually established."""
+    # Parameters kept for API compatibility; Metal on Intel is not established as LLM backend.
+    """Map detection tier → whether LLM acceleration is actually established.
+
+    Metal API availability on Intel Macs does NOT mean Ollama/llama.cpp uses
+    the iGPU for inference. Ollama only establishes Metal acceleration on
+    Apple Silicon. Intel iGPUs are detected but not confirmed as backends.
+    """
     if gpu_tier == GPUTier.APPLE_SILICON:
         return AccelerationStatus.METAL_APPLE
     if gpu_tier == GPUTier.DISCRETE_CUDA:
@@ -375,11 +380,8 @@ def acceleration_for_tier(
     if gpu_tier == GPUTier.DISCRETE_ROCM:
         return AccelerationStatus.ROCM
     if gpu_tier == GPUTier.INTEGRATED:
-        # Intel Mac with Metal-capable iGPU: Metal is available but whether
-        # the installed Ollama/llama.cpp build uses it is unverified.
-        if metal_available and os_name == "Darwin" and "arm" not in os_arch.lower():
-            return AccelerationStatus.METAL_INTEL
-        # Detected iGPU ≠ confirmed Ollama/llama.cpp acceleration
+        # GPU detected but Ollama/llama.cpp backend use is not established.
+        # Metal API presence on Intel does not mean the backend uses it.
         return AccelerationStatus.UNVERIFIED
     return AccelerationStatus.CPU_ONLY
 
@@ -434,11 +436,6 @@ def _estimate_tokens_per_sec(
     if accel == AccelerationStatus.METAL_APPLE:
         base_tps *= 3.5
         confidence = Confidence.MEDIUM
-    elif accel == AccelerationStatus.METAL_INTEL:
-        # Intel Mac with Metal — modest speedup possible but unverified
-        base_tps *= 1.5
-        confidence = Confidence.LOW
-        basis = PerformanceBasis.INFERRED
     elif accel in (AccelerationStatus.CUDA, AccelerationStatus.ROCM):
         base_tps *= 8.0
         confidence = Confidence.MEDIUM
@@ -658,22 +655,14 @@ def evaluate_model(model: ModelInfo, profile: SystemProfile) -> EvaluatedModel:
         explanation.append("GPU detected: no. LLM acceleration: CPU-only.")
     elif gpu_tier == GPUTier.INTEGRATED:
         gpu_name = profile.gpus[0].name if profile.gpus else "integrated GPU"
-        if accel == AccelerationStatus.METAL_INTEL:
-            explanation.append(
-                f"GPU detected: yes ({gpu_name}) — integrated, shared system memory. "
-                f"Metal API: available (GPU supports Metal on macOS). "
-                f"LLM acceleration: possible via Metal backend — not verified for this GPU model."
-            )
-            warnings.append(
-                "Metal support detected but whether the installed Ollama build uses Metal "
-                "on this Intel GPU is unverified. Actual inference speed may differ from estimates."
-            )
-        else:
-            explanation.append(
-                f"GPU detected: yes ({gpu_name}) — integrated, shared system memory. "
-                "LLM acceleration: unverified/backend-dependent."
-            )
-            warnings.append("Detecting an integrated GPU does not prove Ollama can accelerate on it.")
+        explanation.append(
+            f"GPU detected: yes ({gpu_name}) — integrated, shared system memory. "
+            "LLM acceleration: not confirmed."
+        )
+        warnings.append(
+            "Integrated GPU detected but Ollama/llama.cpp backend acceleration "
+            "on this GPU is not established. The tool reports CPU-only performance."
+        )
         fits_vram = True  # no discrete VRAM gate
     elif gpu_tier == GPUTier.APPLE_SILICON:
         will_use_gpu = True
@@ -1055,7 +1044,8 @@ def select_install_candidate(
             ),
         )
 
-    # No verified FITS/TIGHT — disable automatic install
+    # No verified FITS/TIGHT — disable automatic install.
+    # Only offer override for RISKY/UNKNOWN, never for OVER/disqualified.
     override = top
     risky = next(
         (sm for sm in pullable if sm.verified and sm.ram_fit == RAMFit.RISKY and not sm.disqualified),

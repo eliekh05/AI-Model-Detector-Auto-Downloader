@@ -25,8 +25,9 @@ console = Console()
 _SYSTEM_WARNING_MARKERS = (
     "integrated gpu does not prove",
     "detecting an integrated gpu",
-    "llm acceleration: unverified",
+    "llm acceleration: not confirmed",
     "do not assume llm acceleration",
+    "backend acceleration on this gpu is not established",
 )
 
 
@@ -97,13 +98,11 @@ def print_system_profile(profile: SystemProfile) -> None:
         table.add_row("LLM acceleration", _accel_profile_str(accel, tier))
 
         # Show what's verified vs unverified for non-established acceleration
-        if accel in (AccelerationStatus.UNVERIFIED, AccelerationStatus.METAL_INTEL):
+        if accel == AccelerationStatus.UNVERIFIED:
             table.add_row(
                 "Acceleration detail",
-                "[dim]Detection ≠ confirmed backend use. "
-                "GPU detected, compute API "
-                + ("Metal available" if profile.metal_available else "not confirmed")
-                + " — actual GPU acceleration during inference remains unverified.[/]",
+                "[dim]GPU detected but Ollama/llama.cpp backend acceleration "
+                "is not established. Reporting CPU-only performance.[/]",
             )
     else:
         table.add_row("GPU", "[yellow]No GPU detected[/]")
@@ -130,17 +129,16 @@ def print_system_profile(profile: SystemProfile) -> None:
 def _accel_profile_str(accel: AccelerationStatus, tier: GPUTier) -> str:
     if accel == AccelerationStatus.METAL_APPLE:
         return "[green]Metal (Apple Silicon — established)[/]"
-    if accel == AccelerationStatus.METAL_INTEL:
-        return (
-            "[yellow]possible via Metal backend[/] "
-            "[dim](Intel GPU supports Metal — acceleration unverified for this model)[/]"
-        )
     if accel == AccelerationStatus.CUDA:
         return "[green]CUDA (discrete NVIDIA)[/]"
     if accel == AccelerationStatus.ROCM:
         return "[green]ROCm (discrete AMD)[/]"
     if accel == AccelerationStatus.UNVERIFIED:
-        return "[yellow]unverified / backend-dependent[/] [dim](iGPU detected — do not assume LLM acceleration)[/]"
+        return (
+            "[yellow]not confirmed[/] "
+            "[dim](GPU detected but backend acceleration not established — "
+            "do not assume LLM acceleration)[/]"
+        )
     if tier == GPUTier.NONE:
         return "CPU-only"
     return "CPU-only"
@@ -168,8 +166,6 @@ def _confidence_badge(conf: Confidence) -> str:
 def _accel_badge(sm: EvaluatedModel) -> str:
     if sm.acceleration == AccelerationStatus.METAL_APPLE:
         return "[green]Metal (Apple Silicon)[/]"
-    if sm.acceleration == AccelerationStatus.METAL_INTEL:
-        return "[yellow]Metal (Intel — possible, unverified)[/]"
     if sm.acceleration == AccelerationStatus.CUDA:
         return "[green]CUDA[/]" if sm.will_use_gpu else "[yellow]CUDA (partial/offload)[/]"
     if sm.acceleration == AccelerationStatus.ROCM:
@@ -280,11 +276,18 @@ def _model_card_lines(
         f"[dim]LLM accel:[/] {_accel_badge(sm)}"
     )
     if sm.estimated_tps > 0:
-        lines.append(
-            f"[dim]Performance (estimate):[/] ~{sm.estimated_tps:.1f} tok/s "
-            f"({_perf_basis_str(sm.performance_basis)})  "
-            f"[dim]Confidence:[/] {_confidence_badge(sm.tps_confidence)}"
+        weak_estimate = (
+            sm.tps_confidence in (Confidence.LOW, Confidence.UNKNOWN)
+            or sm.performance_basis in (PerformanceBasis.INFERRED, PerformanceBasis.UNKNOWN)
         )
+        if verbose or not weak_estimate:
+            lines.append(
+                f"[dim]Performance (estimate):[/] ~{sm.estimated_tps:.1f} tok/s "
+                f"({_perf_basis_str(sm.performance_basis)})  "
+                f"[dim]Confidence:[/] {_confidence_badge(sm.tps_confidence)}"
+            )
+        else:
+            lines.append("[dim]Performance:[/] not estimated (insufficient data)")
     elif sm.performance_basis == PerformanceBasis.UNKNOWN:
         lines.append("[dim]Performance:[/] not estimated")
     else:
@@ -375,25 +378,56 @@ def print_recommendations(
 
     show_potential = potential[:pot_limit]
     if show_potential:
-        console.print(
-            "\n[bold]Potential candidates[/] "
-            "[dim](unverified, RISKY, or incomplete metadata — not confirmed fits)[/]"
-        )
-        for sm in show_potential:
-            border, fit_label = _fit_title_badge(sm)
-            verified_badge = "[green]verified[/]" if sm.verified else "[dim]UNVERIFIED[/]"
-            install_badge = "[green]● ollama pull[/]" if sm.model.ollama_pullable else "[yellow]● manual download[/]"
-            # No forced #1 winner numbering for potential candidates
-            title = f"[white]{sm.model.full_tag}[/]  {fit_label}  {verified_badge}  {install_badge}"
-            body = "\n".join(
-                _model_card_lines(
-                    sm,
-                    available_ram_gb=available_ram_gb,
-                    verbose=verbose,
-                    suppress_system_warnings=True,
-                )
+        # Separate general/LLM candidates from specialized (ASR, audio, embeddings)
+        _SPECIALIZED_CATS = {"asr", "audio", "embeddings", "embedding", "translation"}
+        general_potential = [
+            sm for sm in show_potential
+            if not {c.lower() for c in sm.model.categories} & _SPECIALIZED_CATS
+        ]
+        specialized_potential = [
+            sm for sm in show_potential
+            if {c.lower() for c in sm.model.categories} & _SPECIALIZED_CATS
+        ]
+
+        if general_potential:
+            console.print(
+                "\n[bold]Potential candidates[/] "
+                "[dim](unverified, RISKY, or incomplete metadata — not confirmed fits)[/]"
             )
-            console.print(Panel(body, title=title, border_style=border, padding=(0, 1)))
+            for sm in general_potential:
+                border, fit_label = _fit_title_badge(sm)
+                verified_badge = "[green]verified[/]" if sm.verified else "[dim]UNVERIFIED[/]"
+                install_badge = "[green]● ollama pull[/]" if sm.model.ollama_pullable else "[yellow]● manual download[/]"
+                title = f"[white]{sm.model.full_tag}[/]  {fit_label}  {verified_badge}  {install_badge}"
+                body = "\n".join(
+                    _model_card_lines(
+                        sm,
+                        available_ram_gb=available_ram_gb,
+                        verbose=verbose,
+                        suppress_system_warnings=True,
+                    )
+                )
+                console.print(Panel(body, title=title, border_style=border, padding=(0, 1)))
+
+        if specialized_potential:
+            console.print(
+                "\n[bold]Specialized models[/] "
+                "[dim](task-specific — not general chat assistants)[/]"
+            )
+            for sm in specialized_potential:
+                border, fit_label = _fit_title_badge(sm)
+                verified_badge = "[green]verified[/]" if sm.verified else "[dim]UNVERIFIED[/]"
+                install_badge = "[green]● ollama pull[/]" if sm.model.ollama_pullable else "[yellow]● manual download[/]"
+                title = f"[white]{sm.model.full_tag}[/]  {fit_label}  {verified_badge}  {install_badge}"
+                body = "\n".join(
+                    _model_card_lines(
+                        sm,
+                        available_ram_gb=available_ram_gb,
+                        verbose=verbose,
+                        suppress_system_warnings=True,
+                    )
+                )
+                console.print(Panel(body, title=title, border_style=border, padding=(0, 1)))
 
     if not recommended and not show_potential:
         console.print("[yellow]No suitable candidates to display for this hardware profile.[/]")

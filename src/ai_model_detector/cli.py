@@ -126,6 +126,9 @@ def _interactive_install(ranked, top_n: int) -> None:
     pullable = [sm for sm in ranked if sm.installable]
     recommended_tags = {sm.model.full_tag for sm in recommended}
 
+    # Filter out DOES_NOT_FIT models from any install offer — they will not work
+    pullable_no_over = [sm for sm in pullable if sm.ram_fit != RAMFit.OVER and not sm.disqualified]
+
     console.print()
     if not recommended:
         console.print(f"[yellow]{partition_advisory or advisory}[/]")
@@ -143,25 +146,40 @@ def _interactive_install(ranked, top_n: int) -> None:
             return
 
         # User declined the safer default — optionally offer override for unverified top
-        wants_override = (
+        # Only offer override for RISKY/UNKNOWN, never for OVER/disqualified
+        if (
             risky_top is not None
             and risky_top.model.full_tag != default.model.full_tag
-            and (risky_top.unverified or risky_top.ram_fit in (RAMFit.UNKNOWN, RAMFit.RISKY, RAMFit.OVER))
-            and Confirm.ask(
-                f"[bold red]Override[/] and install unverified/high-risk "
-                f"[cyan]{risky_top.model.full_tag}[/] "
-                f"({risky_top.ram_fit.value}) anyway?",
+            and risky_top.ram_fit != RAMFit.OVER
+            and not risky_top.disqualified
+        ):
+            risk_detail = ""
+            if risky_top.estimated_total_ram_gb > 0:
+                risk_detail = (
+                    f" (est. ~{risky_top.estimated_total_ram_gb:.1f} GB needed, "
+                    f"{risky_top.ram_fit.value})"
+                )
+            if Confirm.ask(
+                f"[bold red]Override[/] and install "
+                f"[cyan]{risky_top.model.full_tag}[/]{risk_detail} anyway?\n"
+                f"  [dim]This model is not a verified fit. It may be slow, unstable, "
+                f"or fail to load.[/]",
                 default=False,
+            ):
+                _confirm_and_pull(risky_top.model.full_tag)
+                return
+    elif risky_top is not None and risky_top.ram_fit != RAMFit.OVER and not risky_top.disqualified:
+        risk_detail = ""
+        if risky_top.estimated_total_ram_gb > 0:
+            risk_detail = (
+                f" (est. ~{risky_top.estimated_total_ram_gb:.1f} GB needed, "
+                f"{risky_top.ram_fit.value})"
             )
-        )
-        if wants_override:
-            _confirm_and_pull(risky_top.model.full_tag)
-            return
-    elif risky_top is not None:
         if Confirm.ask(
             f"[bold red]Override[/] and install "
-            f"[cyan]{risky_top.model.full_tag}[/] "
-            f"({risky_top.ram_fit.value}) anyway?",
+            f"[cyan]{risky_top.model.full_tag}[/]{risk_detail} anyway?\n"
+            f"  [dim]No verified fit found. This model may be slow, unstable, "
+            f"or fail to load.[/]",
             default=False,
         ):
             _confirm_and_pull(risky_top.model.full_tag)
@@ -173,18 +191,19 @@ def _interactive_install(ranked, top_n: int) -> None:
         )
         return
 
-    # Manual pick from pullable list (recommended first, then potential)
-    if not pullable:
+    # Manual pick — only from models that aren't OVER/disqualified
+    if not pullable_no_over:
         return
 
-    ordered_pullable = [sm for sm in recommended if sm.installable] + [
-        sm for sm in potential if sm.installable
+    # Manual pick from pullable list (recommended first, then potential), filtered
+    ordered_pullable = [sm for sm in recommended if sm.installable and sm.ram_fit != RAMFit.OVER and not sm.disqualified] + [
+        sm for sm in potential if sm.installable and sm.ram_fit != RAMFit.OVER and not sm.disqualified
     ]
     if not ordered_pullable:
-        ordered_pullable = pullable[:top_n]
+        ordered_pullable = pullable_no_over[:top_n]
 
     pullable_choices = {str(i + 1): sm for i, sm in enumerate(ordered_pullable[:top_n])}
-    console.print("\n[dim]Ollama-installable options:[/]")
+    console.print("\n[dim]Ollama-installable options (DOES_NOT_FIT models excluded):[/]")
     for k, sm in pullable_choices.items():
         flag = "verified" if sm.verified else "UNVERIFIED"
         section = "recommended" if sm.model.full_tag in recommended_tags else "potential"
@@ -206,10 +225,10 @@ def _interactive_install(ranked, top_n: int) -> None:
     needs_override = chosen.unverified or chosen.ram_fit in (
         RAMFit.UNKNOWN,
         RAMFit.RISKY,
-        RAMFit.OVER,
     )
     if needs_override and not Confirm.ask(
-        f"[bold red]Confirm override[/] for {chosen.model.full_tag} ({chosen.ram_fit.value})?",
+        f"[bold red]Confirm override[/] for {chosen.model.full_tag} ({chosen.ram_fit.value})?\n"
+        f"  [dim]This model is not a verified fit. It may be slow, unstable, or fail to load.[/]",
         default=False,
     ):
         console.print("[dim]Skipped.[/]")

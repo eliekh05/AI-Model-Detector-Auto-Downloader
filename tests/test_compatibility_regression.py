@@ -171,22 +171,22 @@ def test_provisional_fit_from_inference_still_unverified(intel_8gb):
     assert sm.memory_confidence.value in ("Low", "Unknown")
 
 
-def test_igpu_metal_detected_gets_metal_intel(intel_8gb):
-    """Intel Mac with Metal-capable iGPU → METAL_INTEL, not generic UNVERIFIED."""
+def test_igpu_detected_but_acceleration_not_established(intel_8gb):
+    """Intel Mac with iGPU → UNVERIFIED (GPU detected, backend not confirmed)."""
     tier, _ = _classify_gpu(intel_8gb.gpus, intel_8gb.os_name, intel_8gb.os_arch)
     assert tier == GPUTier.INTEGRATED
     accel = acceleration_for_tier(tier, intel_8gb.os_name, intel_8gb.os_arch, intel_8gb.metal_available)
-    assert accel == AccelerationStatus.METAL_INTEL
+    assert accel == AccelerationStatus.UNVERIFIED
 
     sm = evaluate_model(
         make_model(name="tinyllama", tag="1.1b", size_gb=0.6, quantization="q4_0"),
         intel_8gb,
     )
     assert sm.gpu_detected is True
-    assert sm.acceleration == AccelerationStatus.METAL_INTEL
+    assert sm.acceleration == AccelerationStatus.UNVERIFIED
     assert sm.will_use_gpu is False
-    assert any("Metal" in line for line in sm.explanation)
-    assert any("unverified" in w.lower() or "metal" in w.lower() for w in sm.warnings)
+    assert any("integrated" in line.lower() for line in sm.explanation)
+    assert any("not confirmed" in w.lower() or "not established" in w.lower() for w in sm.warnings)
 
 
 def test_igpu_without_metal_stays_unverified():
