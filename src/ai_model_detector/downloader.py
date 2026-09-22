@@ -186,7 +186,7 @@ def start_ollama_serve() -> subprocess.Popen | None:
                 urllib.request.urlopen("http://localhost:11434", timeout=2)
                 return proc
             except Exception:
-                continue
+                pass
         return proc  # may still be starting, but we've waited long enough
     except Exception:
         return None
