@@ -27,7 +27,6 @@ dependencies = [
     "psutil>=5.9",
     "requests>=2.31",
     "rich>=13.7",
-    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]

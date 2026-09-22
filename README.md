@@ -105,7 +105,8 @@ usage: ai-model-detector [options]
 
 options:
   --import FILE        Import a macOS .spx system profile
-  --category CAT       Filter: chat | code | vision | math | reasoning | embedding
+  --category CAT       Filter: asr, audio, chat, coding, reasoning, embeddings,
+                       vision, translation, multimodal, unknown
   --top N              Number of recommendations to show (default: 5)
   --json               Output full results as JSON
   --installed          List already-installed Ollama models

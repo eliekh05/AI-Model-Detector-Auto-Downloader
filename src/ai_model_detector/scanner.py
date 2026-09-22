@@ -68,6 +68,8 @@ class SystemProfile:
     disk: DiskProfile | None = None
     ollama_installed: bool = False
     ollama_version: str | None = None
+    metal_available: bool = False  # Metal API detected on system (macOS)
+    vulkan_available: bool = False  # Vulkan driver detected (Linux/Windows)
     source: str = "live_scan"  # "live_scan" | "spx_import"
 
     def to_dict(self) -> dict:
@@ -455,6 +457,38 @@ def _windows_gpus() -> list[GPUDevice]:
         return []
 
 
+# ── Compute API detection ───────────────────────────────────────────────
+
+
+def _detect_metal_support() -> bool:
+    """Check if any GPU supports Metal on macOS."""
+    if platform.system() != "Darwin":
+        return False
+    try:
+        result = subprocess.run(
+            ["system_profiler", "SPDisplaysDataType", "-json"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        data = json.loads(result.stdout)
+        for d in data.get("SPDisplaysDataType", []):
+            model = d.get("sppci_model", "").lower()
+            # Metal supported on: Apple Silicon, Intel Iris/HD/UHD, AMD Radeon (2012+)
+            if any(kw in model for kw in ("apple", "iris", "uhd", "hd graphics", "radeon")):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _detect_vulkan_support() -> bool:
+    """Check for Vulkan driver availability on Linux/Windows."""
+    if platform.system() in ("Linux", "Windows"):
+        return shutil.which("vulkaninfo") is not None
+    return False
+
+
 def _scan_gpus() -> list[GPUDevice]:
     system = platform.system()
     gpus = _nvidia_gpus()
@@ -543,17 +577,21 @@ def _parse_spx(spx_path: Path) -> SystemProfile:
     # GPU
     gpu_data = extracted.get("Displays.plist", {})
     gpu_items = gpu_data.get("SPDisplaysDataType", [])
+    integrated_kws = ("iris", "uhd graphics", "hd graphics", "vega", "radeon(tm)")
     gpus = []
     for g in gpu_items:
+        gpu_name = g.get("sppci_model", "Apple GPU")
+        is_integrated = any(kw in gpu_name.lower() for kw in integrated_kws)
         gpus.append(
             GPUDevice(
-                name=g.get("sppci_model", "Apple GPU"),
+                name=gpu_name,
                 vram_gb=None,
                 driver_version=None,
                 metal_support=True,
                 cuda_version=None,
                 rocm_version=None,
                 vulkan_support=False,
+                is_integrated=is_integrated,
             )
         )
 
@@ -568,6 +606,8 @@ def _parse_spx(spx_path: Path) -> SystemProfile:
         disk=_scan_disk(),
         ollama_installed=ollama_installed,
         ollama_version=ollama_ver,
+        metal_available=any(g.metal_support for g in gpus),
+        vulkan_available=False,
         source="spx_import",
     )
 
@@ -595,5 +635,7 @@ def scan_system(spx_path: Path | None = None) -> SystemProfile:
         disk=_scan_disk(),
         ollama_installed=ollama_installed,
         ollama_version=ollama_ver,
+        metal_available=_detect_metal_support(),
+        vulkan_available=_detect_vulkan_support(),
         source="live_scan",
     )

@@ -92,9 +92,19 @@ def print_system_profile(profile: SystemProfile) -> None:
         from .scorer import _classify_gpu, acceleration_for_tier
 
         tier, _ = _classify_gpu(profile.gpus, profile.os_name, profile.os_arch)
-        accel = acceleration_for_tier(tier)
+        accel = acceleration_for_tier(tier, profile.os_name, profile.os_arch, profile.metal_available)
         table.add_row("GPU detected", "yes")
         table.add_row("LLM acceleration", _accel_profile_str(accel, tier))
+
+        # Show what's verified vs unverified for non-established acceleration
+        if accel in (AccelerationStatus.UNVERIFIED, AccelerationStatus.METAL_INTEL):
+            table.add_row(
+                "Acceleration detail",
+                "[dim]Detection ≠ confirmed backend use. "
+                "GPU detected, compute API "
+                + ("Metal available" if profile.metal_available else "not confirmed")
+                + " — actual GPU acceleration during inference remains unverified.[/]",
+            )
     else:
         table.add_row("GPU", "[yellow]No GPU detected[/]")
         table.add_row("GPU detected", "no")
@@ -120,6 +130,11 @@ def print_system_profile(profile: SystemProfile) -> None:
 def _accel_profile_str(accel: AccelerationStatus, tier: GPUTier) -> str:
     if accel == AccelerationStatus.METAL_APPLE:
         return "[green]Metal (Apple Silicon — established)[/]"
+    if accel == AccelerationStatus.METAL_INTEL:
+        return (
+            "[yellow]possible via Metal backend[/] "
+            "[dim](Intel GPU supports Metal — acceleration unverified for this model)[/]"
+        )
     if accel == AccelerationStatus.CUDA:
         return "[green]CUDA (discrete NVIDIA)[/]"
     if accel == AccelerationStatus.ROCM:
@@ -153,6 +168,8 @@ def _confidence_badge(conf: Confidence) -> str:
 def _accel_badge(sm: EvaluatedModel) -> str:
     if sm.acceleration == AccelerationStatus.METAL_APPLE:
         return "[green]Metal (Apple Silicon)[/]"
+    if sm.acceleration == AccelerationStatus.METAL_INTEL:
+        return "[yellow]Metal (Intel — possible, unverified)[/]"
     if sm.acceleration == AccelerationStatus.CUDA:
         return "[green]CUDA[/]" if sm.will_use_gpu else "[yellow]CUDA (partial/offload)[/]"
     if sm.acceleration == AccelerationStatus.ROCM:

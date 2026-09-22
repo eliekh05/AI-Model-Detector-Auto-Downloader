@@ -50,7 +50,8 @@ class AccelerationStatus(Enum):
 
     CUDA = "cuda"
     ROCM = "rocm"
-    METAL_APPLE = "metal_apple"
+    METAL_APPLE = "metal_apple"  # Apple Silicon — Metal established
+    METAL_INTEL = "metal_intel"  # Intel Mac with Metal-capable GPU — possible but unverified
     CPU_ONLY = "cpu_only"
     UNVERIFIED = "unverified"  # GPU present but backend use not established
 
@@ -87,11 +88,15 @@ class RecommendationLabel(Enum):
 
 _OLLAMA_BASE_OVERHEAD_GB = 0.25
 _ACTIVATION_OVERHEAD_GB = 0.15
-_OS_RESERVED_GB = 0.50
+# OS reserve: modern macOS/Linux manage memory dynamically; 0.30 GB is a
+# conservative floor rather than a hard reservation.
+_OS_RESERVED_GB = 0.30
 _SAFETY_HEADROOM_GB = 0.25
 _DEFAULT_CONTEXT_TOKENS = 4096
-# Integrated GPUs (and Apple unified) carve into the same system RAM pool.
-_IGPU_SHARED_RESERVE_GB = 0.75
+# Integrated GPUs (and Apple unified) share system RAM. The reserve accounts
+# for GPU driver overhead and framebuffer — 0.50 GB is conservative for most
+# iGPUs; Apple Silicon uses unified memory so overhead is lower in practice.
+_IGPU_SHARED_RESERVE_GB = 0.50
 
 # Bytes-per-parameter on disk for common quants (GGUF-ish averages).
 # Used only to *infer* size from a parameter-count tag when size_gb is missing.
@@ -356,7 +361,12 @@ def _classify_gpu(gpus: list[GPUDevice], os_name: str, os_arch: str) -> tuple[GP
     )
 
 
-def acceleration_for_tier(gpu_tier: GPUTier) -> AccelerationStatus:
+def acceleration_for_tier(
+    gpu_tier: GPUTier,
+    os_name: str = "",
+    os_arch: str = "",
+    metal_available: bool = False,
+) -> AccelerationStatus:
     """Map detection tier → whether LLM acceleration is actually established."""
     if gpu_tier == GPUTier.APPLE_SILICON:
         return AccelerationStatus.METAL_APPLE
@@ -365,6 +375,10 @@ def acceleration_for_tier(gpu_tier: GPUTier) -> AccelerationStatus:
     if gpu_tier == GPUTier.DISCRETE_ROCM:
         return AccelerationStatus.ROCM
     if gpu_tier == GPUTier.INTEGRATED:
+        # Intel Mac with Metal-capable iGPU: Metal is available but whether
+        # the installed Ollama/llama.cpp build uses it is unverified.
+        if metal_available and os_name == "Darwin" and "arm" not in os_arch.lower():
+            return AccelerationStatus.METAL_INTEL
         # Detected iGPU ≠ confirmed Ollama/llama.cpp acceleration
         return AccelerationStatus.UNVERIFIED
     return AccelerationStatus.CPU_ONLY
@@ -416,10 +430,15 @@ def _estimate_tokens_per_sec(
     elif ram_fit == RAMFit.UNKNOWN:
         base_tps *= 0.85  # uncertain — don't over-claim speed
 
-    accel = acceleration_for_tier(gpu_tier)
+    accel = acceleration_for_tier(gpu_tier, profile.os_name, profile.os_arch, profile.metal_available)
     if accel == AccelerationStatus.METAL_APPLE:
         base_tps *= 3.5
         confidence = Confidence.MEDIUM
+    elif accel == AccelerationStatus.METAL_INTEL:
+        # Intel Mac with Metal — modest speedup possible but unverified
+        base_tps *= 1.5
+        confidence = Confidence.LOW
+        basis = PerformanceBasis.INFERRED
     elif accel in (AccelerationStatus.CUDA, AccelerationStatus.ROCM):
         base_tps *= 8.0
         confidence = Confidence.MEDIUM
@@ -527,7 +546,7 @@ def evaluate_model(model: ModelInfo, profile: SystemProfile) -> EvaluatedModel:
     """Evaluate one model against a hardware profile (facts + classifications, no score)."""
     disk_free = profile.disk.free_gb if profile.disk else 999.0
     gpu_tier, usable_vram = _classify_gpu(profile.gpus, profile.os_name, profile.os_arch)
-    accel = acceleration_for_tier(gpu_tier)
+    accel = acceleration_for_tier(gpu_tier, profile.os_name, profile.os_arch, profile.metal_available)
     gpu_detected = bool(profile.gpus)
     params_b = parse_param_count_b(model)
 
@@ -639,11 +658,22 @@ def evaluate_model(model: ModelInfo, profile: SystemProfile) -> EvaluatedModel:
         explanation.append("GPU detected: no. LLM acceleration: CPU-only.")
     elif gpu_tier == GPUTier.INTEGRATED:
         gpu_name = profile.gpus[0].name if profile.gpus else "integrated GPU"
-        explanation.append(
-            f"GPU detected: yes ({gpu_name}) — integrated, shared system memory. "
-            "LLM acceleration: unverified/backend-dependent."
-        )
-        warnings.append("Detecting an integrated GPU does not prove Ollama can accelerate on it.")
+        if accel == AccelerationStatus.METAL_INTEL:
+            explanation.append(
+                f"GPU detected: yes ({gpu_name}) — integrated, shared system memory. "
+                f"Metal API: available (GPU supports Metal on macOS). "
+                f"LLM acceleration: possible via Metal backend — not verified for this GPU model."
+            )
+            warnings.append(
+                "Metal support detected but whether the installed Ollama build uses Metal "
+                "on this Intel GPU is unverified. Actual inference speed may differ from estimates."
+            )
+        else:
+            explanation.append(
+                f"GPU detected: yes ({gpu_name}) — integrated, shared system memory. "
+                "LLM acceleration: unverified/backend-dependent."
+            )
+            warnings.append("Detecting an integrated GPU does not prove Ollama can accelerate on it.")
         fits_vram = True  # no discrete VRAM gate
     elif gpu_tier == GPUTier.APPLE_SILICON:
         will_use_gpu = True

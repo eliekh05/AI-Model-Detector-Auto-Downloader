@@ -15,13 +15,14 @@ from ai_model_detector.scanner import (
 def profile_intel_mac_8gb(
     available_gb: float = 2.4,
     total_gb: float = 8.0,
+    metal_available: bool = True,
 ) -> SystemProfile:
     """
     Intel MacBook-class profile matching the reported test machine:
       - 8 GB total RAM / ~2.4 GB available
       - Intel i5-8257U, AVX2
       - Intel Iris Plus Graphics 645 (integrated, Metal detected)
-      - Ollama present; LLM acceleration unverified for iGPU
+      - Ollama present
     """
     return SystemProfile(
         os_name="Darwin",
@@ -54,8 +55,14 @@ def profile_intel_mac_8gb(
         disk=DiskProfile(free_gb=120.0, total_gb=256.0, mount="/"),
         ollama_installed=True,
         ollama_version="0.34.2",
+        metal_available=metal_available,
         source="test_fixture",
     )
+
+
+def profile_intel_mac_no_metal() -> SystemProfile:
+    """Intel Mac where Metal is NOT available (e.g. old GPU or non-macOS)."""
+    return profile_intel_mac_8gb(metal_available=False)
 
 
 def make_model(

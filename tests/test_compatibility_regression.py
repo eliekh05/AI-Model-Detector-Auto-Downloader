@@ -25,7 +25,7 @@ from ai_model_detector.scorer import (
     rank_models,
     select_install_candidate,
 )
-from tests.hardware_fixtures import make_model, profile_intel_mac_8gb
+from tests.hardware_fixtures import make_model, profile_intel_mac_8gb, profile_intel_mac_no_metal
 
 
 @pytest.fixture
@@ -171,22 +171,37 @@ def test_provisional_fit_from_inference_still_unverified(intel_8gb):
     assert sm.memory_confidence.value in ("Low", "Unknown")
 
 
-def test_igpu_detection_is_not_treated_as_acceleration(intel_8gb):
-    tier, vram = _classify_gpu(intel_8gb.gpus, intel_8gb.os_name, intel_8gb.os_arch)
+def test_igpu_metal_detected_gets_metal_intel(intel_8gb):
+    """Intel Mac with Metal-capable iGPU → METAL_INTEL, not generic UNVERIFIED."""
+    tier, _ = _classify_gpu(intel_8gb.gpus, intel_8gb.os_name, intel_8gb.os_arch)
     assert tier == GPUTier.INTEGRATED
-    assert vram == 0.0
-    accel = acceleration_for_tier(tier)
-    assert accel == AccelerationStatus.UNVERIFIED
+    accel = acceleration_for_tier(tier, intel_8gb.os_name, intel_8gb.os_arch, intel_8gb.metal_available)
+    assert accel == AccelerationStatus.METAL_INTEL
 
     sm = evaluate_model(
         make_model(name="tinyllama", tag="1.1b", size_gb=0.6, quantization="q4_0"),
         intel_8gb,
     )
     assert sm.gpu_detected is True
-    assert sm.acceleration == AccelerationStatus.UNVERIFIED
+    assert sm.acceleration == AccelerationStatus.METAL_INTEL
     assert sm.will_use_gpu is False
-    assert any("Iris Plus" in line or "integrated" in line.lower() for line in sm.explanation)
-    assert any("unverified" in w.lower() or "does not prove" in w.lower() for w in sm.warnings + sm.explanation)
+    assert any("Metal" in line for line in sm.explanation)
+    assert any("unverified" in w.lower() or "metal" in w.lower() for w in sm.warnings)
+
+
+def test_igpu_without_metal_stays_unverified():
+    """Intel iGPU without Metal availability → UNVERIFIED."""
+    profile = profile_intel_mac_no_metal()
+    tier, _ = _classify_gpu(profile.gpus, profile.os_name, profile.os_arch)
+    assert tier == GPUTier.INTEGRATED
+    accel = acceleration_for_tier(tier, profile.os_name, profile.os_arch, profile.metal_available)
+    assert accel == AccelerationStatus.UNVERIFIED
+
+    sm = evaluate_model(
+        make_model(name="tinyllama", tag="1.1b", size_gb=0.6, quantization="q4_0"),
+        profile,
+    )
+    assert sm.acceleration == AccelerationStatus.UNVERIFIED
 
 
 def test_ollama_pullable_is_not_guaranteed_runnable(intel_8gb):
@@ -443,3 +458,61 @@ def test_potential_vs_recommended_partition(intel_8gb):
         rec_tags = {s.model.full_tag for s in recommended}
         assert risky[0].model.full_tag in pot_tags
         assert risky[0].model.full_tag not in rec_tags
+
+
+def test_memory_overhead_is_reasonable(intel_8gb):
+    """Total overhead on iGPU system must be < 1.6 GB (was ~1.9 GB, now reduced)."""
+    # Overhead = total - weights - kv for a known-size model
+    sm = evaluate_model(
+        make_model(name="tinyllama", tag="1.1b", size_gb=0.6, quantization="q4_0"),
+        intel_8gb,
+    )
+    # weights ~0.6 GB + kv ~0.05 GB + overhead = total
+    # overhead should be < 1.6 GB on iGPU
+    overhead = sm.estimated_total_ram_gb - 0.6 - 0.05
+    assert overhead < 1.6, f"Overhead {overhead:.2f} GB exceeds 1.6 GB cap"
+    assert overhead > 0.5, f"Overhead {overhead:.2f} GB unrealistically low"
+
+
+def test_asr_models_not_labeled_chat(intel_8gb):
+    """ASR models must not get GENERAL_CHAT label."""
+    asr_model = make_model(
+        name="whisper-tiny",
+        tag="latest",
+        size_gb=0.4,
+        quantization="q4_0",
+        categories=["asr"],
+        category_source="metadata",
+    )
+    chat_model = make_model(
+        name="tinyllama",
+        tag="1.1b",
+        size_gb=0.6,
+        quantization="q4_0",
+        categories=["chat"],
+        category_source="inferred",
+    )
+    ranked = rank_models([asr_model, chat_model], intel_8gb, top_n=5)
+    asr_sm = next(sm for sm in ranked if "whisper" in sm.model.full_tag)
+    assert RecommendationLabel.GENERAL_CHAT not in asr_sm.labels
+    chat_sm = next(sm for sm in ranked if "tinyllama" in sm.model.full_tag)
+    assert RecommendationLabel.GENERAL_CHAT in chat_sm.labels
+
+
+def test_potential_candidates_not_in_recommended(intel_8gb):
+    """Potential candidates must never appear in the recommended list."""
+    models = [
+        make_model(name="tinyllama", tag="1.1b", size_gb=0.6, quantization="q4_0"),
+        make_model(name="granite4.1", tag="3b", quantization="q4_k_m"),  # unverified
+        make_model(name="mystery", tag="latest"),  # unverified, no size
+    ]
+    ranked = rank_models(models, intel_8gb, top_n=10)
+    recommended, potential, _ = partition_recommendations(ranked)
+    rec_tags = {sm.model.full_tag for sm in recommended}
+    pot_tags = {sm.model.full_tag for sm in potential}
+    # No overlap
+    assert rec_tags.isdisjoint(pot_tags)
+    # Verified FITS models are in recommended, not potential
+    for sm in recommended:
+        assert sm.verified
+        assert sm.ram_fit in (RAMFit.FITS, RAMFit.TIGHT)

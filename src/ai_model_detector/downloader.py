@@ -177,8 +177,17 @@ def start_ollama_serve() -> subprocess.Popen | None:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        time.sleep(2)  # give it a moment to bind
-        return proc
+        # Retry connection up to 5 times with 0.5s delay instead of unconditional sleep
+        import urllib.request
+
+        for _ in range(5):
+            time.sleep(0.5)
+            try:
+                urllib.request.urlopen("http://localhost:11434", timeout=2)
+                return proc
+            except Exception:
+                continue
+        return proc  # may still be starting, but we've waited long enough
     except Exception:
         return None
 
