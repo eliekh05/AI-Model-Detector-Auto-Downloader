@@ -1,13 +1,16 @@
 """
 Regression tests: classification-first recommendations (no numeric suitability score).
 
-Primary profile: 8 GB Intel MacBook Pro (Iris Plus 645, ~2.2 GB available RAM).
+Primary profile: 8 GB Intel MacBook Pro (Iris Plus 645, ~2.4 GB available RAM).
 """
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
+from ai_model_detector.registry import infer_task_categories
 from ai_model_detector.scorer import (
     AccelerationStatus,
     EvaluatedModel,
@@ -18,6 +21,7 @@ from ai_model_detector.scorer import (
     acceleration_for_tier,
     estimate_memory,
     evaluate_model,
+    partition_recommendations,
     rank_models,
     select_install_candidate,
 )
@@ -31,9 +35,11 @@ def intel_8gb():
 
 def _assert_no_numeric_score(sm: EvaluatedModel) -> None:
     assert not hasattr(sm, "score") or getattr(sm, "score", None) is None
+    assert "score" not in sm.__dataclass_fields__
     # rank_reason must not resurrect a disguised 0–100 score
     assert "/100" not in sm.rank_reason
     assert "Score " not in sm.rank_reason
+    assert not re.search(r"\bscore\b", sm.rank_reason, re.I)
 
 
 def test_no_numeric_suitability_score_field(intel_8gb):
@@ -48,12 +54,9 @@ def test_no_numeric_suitability_score_field(intel_8gb):
     evaluated = [evaluate_model(m, intel_8gb) for m in models]
     for sm in evaluated:
         _assert_no_numeric_score(sm)
-        assert "score" not in sm.__dataclass_fields__
 
-    # Distinct footprints still produce distinct classifications / estimates
     known = [sm for sm in evaluated if sm.verified]
     assert len({round(sm.estimated_total_ram_gb, 1) for sm in known}) >= 2
-    # Identical incomplete metadata → same UNKNOWN class (not a false FITS)
     unknown = [sm for sm in evaluated if not sm.verified]
     assert all(sm.ram_fit == RAMFit.UNKNOWN for sm in unknown)
     assert all(not sm.verified for sm in unknown)
@@ -126,7 +129,7 @@ def test_unknown_memory_metadata_is_not_treated_as_fit(intel_8gb):
 
 
 def test_exceeding_available_ram_is_not_high_compatibility(intel_8gb):
-    """~3.9+ GB needed with 2.2 GB free must not be classified as FITS."""
+    """~3.9+ GB needed with ~2.4 GB free must not be classified as FITS."""
     sm = evaluate_model(
         make_model(name="granite3.3", tag="3b", size_gb=2.0, quantization="q4_k_m"),
         intel_8gb,
@@ -134,6 +137,26 @@ def test_exceeding_available_ram_is_not_high_compatibility(intel_8gb):
     assert sm.estimated_total_ram_gb > intel_8gb.ram.available_gb
     assert sm.ram_fit in (RAMFit.TIGHT, RAMFit.RISKY, RAMFit.OVER)
     assert sm.ram_fit != RAMFit.FITS
+
+
+def test_insufficient_available_ram_and_headroom(intel_8gb):
+    """Estimates must reflect available-RAM shortfall; FITS requires headroom in free RAM."""
+    sm = evaluate_model(
+        make_model(name="granite3.3", tag="3b", size_gb=2.0, quantization="q4_k_m"),
+        intel_8gb,
+    )
+    assert sm.estimated_total_ram_gb > intel_8gb.ram.available_gb
+    shortfall = sm.estimated_total_ram_gb - intel_8gb.ram.available_gb
+    assert shortfall > 0
+    assert sm.ram_fit != RAMFit.FITS
+
+    tiny = evaluate_model(
+        make_model(name="tinyllama", tag="1.1b", size_gb=0.6, quantization="q4_0"),
+        intel_8gb,
+    )
+    # Tiny may be FITS or TIGHT depending on overhead — never UNKNOWN when size known
+    assert tiny.verified
+    assert tiny.ram_fit in (RAMFit.FITS, RAMFit.TIGHT, RAMFit.RISKY)
 
 
 def test_provisional_fit_from_inference_still_unverified(intel_8gb):
@@ -178,6 +201,18 @@ def test_ollama_pullable_is_not_guaranteed_runnable(intel_8gb):
     assert RecommendationLabel.NOT_RECOMMENDED in rank_models([sm.model], intel_8gb)[0].labels
 
 
+def test_pullability_does_not_imply_runnability(intel_8gb):
+    """Runtime-compatible and pullable still distinct from hardware fit."""
+    sm = evaluate_model(
+        make_model(name="llama3.1", tag="70b", size_gb=40.0, quantization="q4_k_m"),
+        intel_8gb,
+    )
+    assert sm.installable is True
+    assert sm.runtime_compatible is True
+    assert sm.ram_fit == RAMFit.OVER
+    assert not sm.is_safe_install_default
+
+
 def test_unverified_top_is_not_silent_install_default(intel_8gb):
     models = [
         make_model(name="granite4.1", tag="3b", quantization="q4_k_m"),
@@ -204,16 +239,82 @@ def test_no_verified_candidate_says_so(intel_8gb):
     assert "No verified model currently fits the available memory" in msg
     assert "Automatic installation is disabled" in msg
 
+    recommended, potential, advisory = partition_recommendations(ranked)
+    assert recommended == []
+    assert advisory is not None
+    assert "No verified model" in advisory
+
+
+def test_no_forced_recommendation_when_nothing_verified(intel_8gb):
+    models = [
+        make_model(name="mystery-a", tag="0.6b", quantization="q4_0"),
+        make_model(name="mystery-b", tag="3b", quantization="q4_k_m"),
+    ]
+    ranked = rank_models(models, intel_8gb, top_n=5)
+    recommended, potential, advisory = partition_recommendations(ranked)
+    assert recommended == []
+    assert potential
+    assert advisory is not None
+    default, _, _ = select_install_candidate(ranked)
+    assert default is None
+    for sm in potential:
+        assert RecommendationLabel.BEST_FIT not in sm.labels
+
+
+def test_compatibility_ordering_verified_fits_before_unknown(intel_8gb):
+    models = [
+        make_model(name="mystery", tag="latest"),
+        make_model(name="tinyllama", tag="1.1b", size_gb=0.6, quantization="q4_0"),
+        make_model(name="granite4.1", tag="3b", quantization="q4_k_m"),
+        make_model(name="llama3.1", tag="30b", size_gb=19.0, quantization="q4_k_m"),
+    ]
+    ranked = rank_models(models, intel_8gb, top_n=10)
+    first_fit_idx = next(
+        (i for i, sm in enumerate(ranked) if sm.verified and sm.ram_fit in (RAMFit.FITS, RAMFit.TIGHT)),
+        None,
+    )
+    assert first_fit_idx is not None
+    for i, sm in enumerate(ranked):
+        if sm.ram_fit in (RAMFit.UNKNOWN, RAMFit.OVER) or sm.disqualified:
+            assert i > first_fit_idx
+
+    recommended, potential, _ = partition_recommendations(ranked)
+    assert recommended
+    assert recommended[0].verified
+    assert recommended[0].ram_fit in (RAMFit.FITS, RAMFit.TIGHT)
+    assert all(sm.model.full_tag != recommended[0].model.full_tag for sm in potential)
+
+
+def test_rank_models_never_promotes_unknown_over_verified_fit(intel_8gb):
+    models = [
+        make_model(name="mystery", tag="latest"),
+        make_model(name="tinyllama", tag="1.1b", size_gb=0.6, quantization="q4_0"),
+        make_model(name="granite4.1", tag="3b", quantization="q4_k_m"),
+    ]
+    ranked = rank_models(models, intel_8gb, top_n=5)
+    assert ranked[0].verified
+    assert ranked[0].ram_fit in (RAMFit.FITS, RAMFit.TIGHT)
+    unknown_idx = next(i for i, sm in enumerate(ranked) if sm.ram_fit == RAMFit.UNKNOWN)
+    assert unknown_idx > 0
+
 
 def test_recommendations_include_explanation_and_evidence(intel_8gb):
     models = [
-        make_model(name="tinyllama", tag="1.1b", size_gb=0.6, quantization="q4_0", categories=["chat"]),
+        make_model(
+            name="tinyllama",
+            tag="1.1b",
+            size_gb=0.6,
+            quantization="q4_0",
+            categories=["chat"],
+            category_source="inferred",
+        ),
         make_model(
             name="qwen2.5-coder",
             tag="3b",
             size_gb=1.9,
             quantization="q4_k_m",
-            categories=["code", "chat"],
+            categories=["coding", "chat"],
+            category_source="inferred",
         ),
         make_model(name="mystery", tag="latest"),
     ]
@@ -272,14 +373,73 @@ def test_insufficient_ram_detected_for_oversize_model(intel_8gb):
     assert any("RAM" in w for w in sm.warnings)
 
 
-def test_rank_models_never_promotes_unknown_over_verified_fit(intel_8gb):
+def test_asr_not_labeled_chat():
+    cats, src = infer_task_categories(
+        "handy-computer/nemotron-3.5-asr-streaming-0.6b-gguf",
+        "Streaming ASR GGUF",
+    )
+    assert "asr" in cats
+    assert "chat" not in cats
+    assert src in ("inferred", "metadata")
+
+    cats2, src2 = infer_task_categories(
+        "openai/whisper-tiny",
+        "",
+        pipeline_tag="automatic-speech-recognition",
+        tags=["automatic-speech-recognition", "gguf"],
+    )
+    assert "asr" in cats2
+    assert "chat" not in cats2
+    assert src2 == "metadata"
+
+
+def test_gguf_alone_does_not_imply_chat():
+    cats, src = infer_task_categories("some-org/mystery-weights-gguf", "")
+    assert cats == ["unknown"]
+    assert src == "unknown"
+    assert "chat" not in cats
+
+
+def test_missing_metadata_produces_unknown_task():
+    cats, src = infer_task_categories("acme/untitled-model", "")
+    assert cats == ["unknown"]
+    assert src == "unknown"
+
+
+def test_no_numeric_score_in_recommendation_pipeline(intel_8gb):
     models = [
-        make_model(name="mystery", tag="latest"),
         make_model(name="tinyllama", tag="1.1b", size_gb=0.6, quantization="q4_0"),
         make_model(name="granite4.1", tag="3b", quantization="q4_k_m"),
     ]
     ranked = rank_models(models, intel_8gb, top_n=5)
-    assert ranked[0].verified
-    assert ranked[0].ram_fit in (RAMFit.FITS, RAMFit.TIGHT)
-    unknown_idx = next(i for i, sm in enumerate(ranked) if sm.ram_fit == RAMFit.UNKNOWN)
-    assert unknown_idx > 0
+    blob = " ".join(
+        [
+            sm.rank_reason
+            + " ".join(sm.explanation)
+            + " ".join(sm.warnings)
+            + " ".join(sm.label_names)
+            for sm in ranked
+        ]
+    )
+    assert "score" not in blob.lower()
+    assert "/100" not in blob
+    for sm in ranked:
+        _assert_no_numeric_score(sm)
+
+
+def test_potential_vs_recommended_partition(intel_8gb):
+    models = [
+        make_model(name="tinyllama", tag="1.1b", size_gb=0.6, quantization="q4_0"),
+        make_model(name="granite4.1", tag="3b", quantization="q4_k_m"),
+        make_model(name="granite3.3", tag="3b", size_gb=2.0, quantization="q4_k_m"),
+    ]
+    ranked = rank_models(models, intel_8gb, top_n=10)
+    recommended, potential, _ = partition_recommendations(ranked)
+    assert any(sm.model.full_tag == "tinyllama:1.1b" for sm in recommended)
+    assert any(sm.ram_fit == RAMFit.UNKNOWN for sm in potential)
+    risky = [sm for sm in ranked if sm.model.full_tag == "granite3.3:3b"]
+    if risky and risky[0].ram_fit == RAMFit.RISKY:
+        pot_tags = {s.model.full_tag for s in potential}
+        rec_tags = {s.model.full_tag for s in recommended}
+        assert risky[0].model.full_tag in pot_tags
+        assert risky[0].model.full_tag not in rec_tags

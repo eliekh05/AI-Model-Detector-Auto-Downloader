@@ -29,6 +29,67 @@ REQUEST_TIMEOUT = 15
 USER_AGENT = "AI-Model-Detector/1.0 (https://github.com/eliekh05/AI-Model-Detector-Auto-Downloader)"
 
 
+# Canonical task categories. Never invent "chat" merely because a file is GGUF.
+TASK_CATEGORIES = (
+    "asr",
+    "audio",
+    "chat",
+    "coding",
+    "reasoning",
+    "embeddings",
+    "vision",
+    "translation",
+    "multimodal",
+    "unknown",
+)
+
+# CLI / filter aliases → canonical name
+_CATEGORY_ALIASES = {
+    "code": "coding",
+    "codes": "coding",
+    "embedding": "embeddings",
+    "embed": "embeddings",
+    "speech": "asr",
+    "speech-to-text": "asr",
+    "stt": "asr",
+    "math": "reasoning",
+    "general": "chat",
+}
+
+# Hugging Face pipeline_tag → canonical category (metadata, not a guess)
+_PIPELINE_TAG_TO_CATEGORY = {
+    "automatic-speech-recognition": "asr",
+    "audio-classification": "audio",
+    "audio-to-audio": "audio",
+    "text-to-speech": "audio",
+    "text-to-audio": "audio",
+    "translation": "translation",
+    "summarization": "chat",
+    "text-generation": "chat",
+    "text2text-generation": "chat",
+    "conversational": "chat",
+    "feature-extraction": "embeddings",
+    "sentence-similarity": "embeddings",
+    "image-classification": "vision",
+    "object-detection": "vision",
+    "image-segmentation": "vision",
+    "image-to-text": "vision",
+    "image-text-to-text": "multimodal",
+    "visual-question-answering": "multimodal",
+    "document-question-answering": "multimodal",
+    "any-to-any": "multimodal",
+    "zero-shot-image-classification": "vision",
+}
+
+
+def normalize_category(category: str) -> str:
+    """Map aliases to canonical task categories."""
+    key = (category or "").strip().lower()
+    if not key:
+        return "unknown"
+    return _CATEGORY_ALIASES.get(key, key)
+
+
 @dataclass
 class ModelInfo:
     name: str  # e.g. "llama3.2"
@@ -39,7 +100,9 @@ class ModelInfo:
     vram_required_gb: float  # 0 if CPU-only is fine
     quantization: str  # e.g. "q4_0", "q4_K_M", "f16"
     description: str
-    categories: list[str] = field(default_factory=list)  # ["chat", "code", "vision"]
+    categories: list[str] = field(default_factory=list)  # canonical task categories
+    # "metadata" = HF pipeline/tags; "inferred" = name/description heuristics; "unknown" = none
+    category_source: str = "unknown"
     known_issues: list[str] = field(default_factory=list)  # from community sources
     hf_downloads: int = 0  # Hugging Face download count (0 if N/A)
     ollama_pull_count: int = 0  # from Ollama library page
@@ -213,7 +276,7 @@ def _fetch_ollama_library() -> list[ModelInfo]:
         # Update sizes from size_map
         tag_entries = [(tag, size_map.get(tag, size)) for tag, size in tag_entries]
 
-        categories = _infer_categories(slug, description)
+        categories, category_source = infer_task_categories(slug, description)
 
         if not tag_entries:
             # We know this model exists but couldn't parse its tags —
@@ -236,6 +299,7 @@ def _fetch_ollama_library() -> list[ModelInfo]:
                     quantization=quant,
                     description=description,
                     categories=categories,
+                    category_source=category_source,
                     ollama_pull_count=pull_count,
                     source="ollama",
                     ollama_pullable=True,
@@ -245,21 +309,154 @@ def _fetch_ollama_library() -> list[ModelInfo]:
     return models
 
 
+def infer_task_categories(
+    name: str,
+    description: str = "",
+    *,
+    tags: list[str] | None = None,
+    pipeline_tag: str | None = None,
+) -> tuple[list[str], str]:
+    """
+    Assign task categories from reliable metadata first, then name/description cues.
+
+    Returns (categories, source) where source is:
+      - "metadata" — Hugging Face pipeline_tag / explicit tags
+      - "inferred" — name or description heuristics
+      - "unknown"  — insufficient evidence (never invent "chat" for GGUF alone)
+
+    Supported categories: asr, audio, chat, coding, reasoning, embeddings,
+    vision, translation, multimodal, unknown.
+    """
+    tags = tags or []
+    found: list[str] = []
+    source = "unknown"
+
+    # ── 1. Explicit HF pipeline_tag (strongest) ─────────────────────────────
+    if pipeline_tag:
+        mapped = _PIPELINE_TAG_TO_CATEGORY.get(pipeline_tag.strip().lower())
+        if mapped:
+            found.append(mapped)
+            source = "metadata"
+
+    # ── 2. Explicit HF / library tags ───────────────────────────────────────
+    tag_set = {t.strip().lower() for t in tags if isinstance(t, str)}
+    tag_hits: list[str] = []
+    if tag_set & {"asr", "automatic-speech-recognition", "speech-to-text", "whisper"}:
+        tag_hits.append("asr")
+    if tag_set & {"audio", "text-to-speech", "tts"}:
+        tag_hits.append("audio")
+    if tag_set & {"translation", "translate"}:
+        tag_hits.append("translation")
+    if tag_set & {"embedding", "embeddings", "feature-extraction", "sentence-similarity"}:
+        tag_hits.append("embeddings")
+    if tag_set & {"vision", "image", "image-text-to-text"}:
+        tag_hits.append("vision")
+    if tag_set & {"multimodal", "any-to-any", "vlm"}:
+        tag_hits.append("multimodal")
+    if tag_set & {"code", "coding", "codellama", "starcoder"}:
+        tag_hits.append("coding")
+    if tag_set & {"reasoning", "math"}:
+        tag_hits.append("reasoning")
+    if tag_set & {"conversational", "chat", "text-generation"}:
+        tag_hits.append("chat")
+
+    for cat in tag_hits:
+        if cat not in found:
+            found.append(cat)
+    if tag_hits and source != "metadata":
+        source = "metadata"
+
+    # ── 3. Name / description heuristics (weaker) ───────────────────────────
+    text = f"{name} {description}".lower()
+    # Strip format-only tokens so "gguf" never implies chat
+    text_for_task = re.sub(r"\b(gguf|ggml|safetensors|bin|q\d[_k0-9]*|f16|f32|bf16)\b", " ", text)
+
+    inferred: list[str] = []
+    if any(
+        kw in text_for_task
+        for kw in (
+            "asr",
+            "speech-to-text",
+            "speech recognition",
+            "speech_recognition",
+            "automatic-speech",
+            "transcri",
+            "whisper",
+            "streaming-asr",
+            "nemotron-3.5-asr",
+            "nemotron-asr",
+        )
+    ) or re.search(r"(?<![a-z])asr(?![a-z])", text_for_task) or "-asr-" in text_for_task or text_for_task.endswith("-asr"):
+        inferred.append("asr")
+    if any(kw in text_for_task for kw in ("text-to-speech", "tts", "audio generation", "voice clone")) and "asr" not in inferred:
+        inferred.append("audio")
+    elif "audio" in text_for_task and not inferred:
+        # Generic "audio" without ASR/TTS cues — keep as audio, not chat
+        if any(kw in text_for_task for kw in ("speech", "sound", "voice", "waveform")):
+            inferred.append("audio")
+    if any(kw in text_for_task for kw in ("translat", "nllb", "marianmt", "opus-mt")):
+        inferred.append("translation")
+    if any(
+        kw in text_for_task
+        for kw in ("embed", "embedding", "nomic-embed", "mxbai", "bge-", "e5-", "gte-")
+    ):
+        inferred.append("embeddings")
+    if any(
+        kw in text_for_task
+        for kw in ("vision", "llava", "bakllava", "minicpm-v", "image-to-text", "clip-")
+    ):
+        inferred.append("vision")
+    if any(
+        kw in text_for_task
+        for kw in ("multimodal", "any-to-any", "vision-language", "vlm", "image-text")
+    ):
+        inferred.append("multimodal")
+    if any(
+        kw in text_for_task
+        for kw in ("coder", "starcoder", "deepseek-coder", "codellama", "code llama", "coding")
+    ) or re.search(r"(?<![a-z])code(?![a-z])", text_for_task):
+        inferred.append("coding")
+    if any(
+        kw in text_for_task
+        for kw in ("reasoning", "mathstral", "qwen2-math", "deepseek-r1", "qwq")
+    ) or re.search(r"(?<![a-z])math(?![a-z])", text_for_task):
+        inferred.append("reasoning")
+    # Chat only with explicit conversational cues — never the silent default
+    if any(
+        kw in text_for_task
+        for kw in (
+            "chat",
+            "instruct",
+            "assistant",
+            "conversational",
+            "dialogue",
+            "instruction-tuned",
+            "instruction tuned",
+        )
+    ):
+        inferred.append("chat")
+
+    for cat in inferred:
+        if cat not in found:
+            found.append(cat)
+    if inferred and source == "unknown":
+        source = "inferred"
+
+    if not found:
+        return ["unknown"], "unknown"
+
+    # Prefer specific non-chat labels when ASR/audio/etc. are present
+    if "asr" in found and "chat" in found:
+        found = [c for c in found if c != "chat"]
+    if "embeddings" in found and "chat" in found:
+        found = [c for c in found if c != "chat"]
+
+    return found, source
+
+
+# Backward-compatible wrapper used by older call sites / tests
 def _infer_categories(name: str, description: str) -> list[str]:
-    text = (name + " " + description).lower()
-    cats = []
-    if any(kw in text for kw in ["code", "coder", "starcoder", "deepseek-coder", "codellama"]):
-        cats.append("code")
-    if any(kw in text for kw in ["vision", "image", "visual", "llava", "bakllava", "minicpm-v"]):
-        cats.append("vision")
-    if any(kw in text for kw in ["embed", "embedding", "nomic-embed", "mxbai"]):
-        cats.append("embedding")
-    if any(kw in text for kw in ["math", "mathstral", "qwen2-math"]):
-        cats.append("math")
-    if any(kw in text for kw in ["reasoning", "think", "reason", "o1", "qwq"]):
-        cats.append("reasoning")
-    if not cats:
-        cats.append("chat")
+    cats, _ = infer_task_categories(name, description)
     return cats
 
 
@@ -312,16 +509,21 @@ def _fetch_hf_popular_models(limit: int = 30) -> list[ModelInfo]:
         for item in data:
             model_id = item.get("modelId", "") or item.get("id", "")
             downloads = item.get("downloads", 0)
-            description = (item.get("cardData", {}) or {}).get("language", [""])[0]
-            tags = item.get("tags", [])
+            card = item.get("cardData", {}) or {}
+            description = ""
+            if isinstance(card.get("language"), list) and card["language"]:
+                description = str(card["language"][0])
+            elif isinstance(card.get("language"), str):
+                description = card["language"]
+            tags = item.get("tags", []) or []
+            pipeline_tag = item.get("pipeline_tag") or card.get("pipeline_tag")
 
-            categories = []
-            if "code" in tags or "code" in model_id.lower():
-                categories.append("code")
-            if "vision" in tags:
-                categories.append("vision")
-            if not categories:
-                categories.append("chat")
+            categories, category_source = infer_task_categories(
+                model_id,
+                description,
+                tags=[t for t in tags if isinstance(t, str)],
+                pipeline_tag=pipeline_tag if isinstance(pipeline_tag, str) else None,
+            )
 
             models.append(
                 ModelInfo(
@@ -334,6 +536,7 @@ def _fetch_hf_popular_models(limit: int = 30) -> list[ModelInfo]:
                     quantization="gguf",
                     description=description or f"HuggingFace GGUF (manual download): {model_id}",
                     categories=categories,
+                    category_source=category_source,
                     hf_downloads=downloads,
                     source="huggingface",
                     ollama_pullable=False,
@@ -396,6 +599,7 @@ def _fetch_local_ollama_models() -> list[ModelInfo]:
             size_bytes = item.get("size", 0)
             size_gb = round(size_bytes / (1024**3), 2) if size_bytes else 0.0
             ram_gb, vram_gb = _ram_from_size(size_gb, has_gpu=True)
+            categories, category_source = infer_task_categories(name, "")
             models.append(
                 ModelInfo(
                     name=name,
@@ -406,7 +610,8 @@ def _fetch_local_ollama_models() -> list[ModelInfo]:
                     vram_required_gb=vram_gb,
                     quantization=_infer_quantization(tag),
                     description="Already installed locally",
-                    categories=_infer_categories(name, ""),
+                    categories=categories,
+                    category_source=category_source,
                     ollama_pull_count=0,
                     source="ollama",
                     ollama_pullable=True,

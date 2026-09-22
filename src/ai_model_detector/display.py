@@ -16,9 +16,18 @@ from .scorer import (
     GPUTier,
     PerformanceBasis,
     RAMFit,
+    partition_recommendations,
 )
 
 console = Console()
+
+# Warnings that apply to the whole machine — print once, not per model card.
+_SYSTEM_WARNING_MARKERS = (
+    "integrated gpu does not prove",
+    "detecting an integrated gpu",
+    "llm acceleration: unverified",
+    "do not assume llm acceleration",
+)
 
 
 def print_banner() -> None:
@@ -149,7 +158,7 @@ def _accel_badge(sm: EvaluatedModel) -> str:
     if sm.acceleration == AccelerationStatus.ROCM:
         return "[green]ROCm[/]" if sm.will_use_gpu else "[yellow]ROCm (partial/offload)[/]"
     if sm.acceleration == AccelerationStatus.UNVERIFIED:
-        return "[yellow]GPU detected — LLM accel unverified/backend-dependent[/]"
+        return "[yellow]GPU detected — LLM accel unverified[/]"
     return "[dim]CPU-only[/]"
 
 
@@ -162,116 +171,218 @@ def _perf_basis_str(basis: PerformanceBasis) -> str:
     }[basis]
 
 
-def print_recommendations(
-    evaluated: list[EvaluatedModel], top: int = 5, available_ram_gb: float | None = None
-) -> None:
-    console.print()
-    console.rule("[bold cyan]Model Recommendations[/]")
+def _is_system_warning(text: str) -> bool:
+    lower = text.lower()
+    return any(marker in lower for marker in _SYSTEM_WARNING_MARKERS)
 
-    for shown, sm in enumerate(evaluated[:top], start=1):
-        m = sm.model
 
-        if sm.disqualified:
-            border = "red"
-            fit_label = "[red]⛔ INCOMPATIBLE[/]"
-        elif sm.unverified or sm.ram_fit == RAMFit.UNKNOWN:
-            border = "dim"
-            fit_label = "[dim]? UNVERIFIED[/]"
-        elif sm.ram_fit == RAMFit.FITS:
-            border = "green"
-            fit_label = "[green]✓ FITS[/]"
-        elif sm.ram_fit == RAMFit.TIGHT:
-            border = "yellow"
-            fit_label = "[yellow]⚠ TIGHT[/]"
-        elif sm.ram_fit == RAMFit.RISKY:
-            border = "orange3"
-            fit_label = "[orange3]⚠ RISKY[/]"
-        elif sm.ram_fit == RAMFit.OVER:
-            border = "red"
-            fit_label = "[red]✗ DOES_NOT_FIT[/]"
-        else:
-            border = "dim"
-            fit_label = "[dim]? UNKNOWN[/]"
+def _category_display(sm: EvaluatedModel) -> str:
+    cats = ", ".join(sm.model.categories) if sm.model.categories else "unknown"
+    src = getattr(sm.model, "category_source", "unknown") or "unknown"
+    if cats == "unknown" or cats == "":
+        return "[dim]unknown[/]"
+    if src == "metadata":
+        return f"{cats} [dim](from metadata)[/]"
+    if src == "inferred":
+        return f"{cats} [dim](inferred)[/]"
+    return f"{cats} [dim](uncertain)[/]"
 
-        install_badge = "[green]● ollama pull[/]" if m.ollama_pullable else "[yellow]● manual download[/]"
-        verified_badge = "[green]verified[/]" if sm.verified else "[dim]UNVERIFIED[/]"
-        labels_str = ", ".join(sm.label_names) if sm.labels else "—"
 
-        title = f"[bold]#{shown}[/]  [white]{m.full_tag}[/]  {fit_label}  {verified_badge}  {install_badge}"
+def _fit_title_badge(sm: EvaluatedModel) -> tuple[str, str]:
+    """Return (border_style, fit_label) for a model card."""
+    if sm.disqualified:
+        return "red", "[red]⛔ INCOMPATIBLE[/]"
+    if sm.unverified or sm.ram_fit == RAMFit.UNKNOWN:
+        return "dim", "[dim]? UNKNOWN[/]"
+    if sm.ram_fit == RAMFit.FITS:
+        return "green", "[green]✓ FITS[/]"
+    if sm.ram_fit == RAMFit.TIGHT:
+        return "yellow", "[yellow]⚠ TIGHT[/]"
+    if sm.ram_fit == RAMFit.RISKY:
+        return "orange3", "[orange3]⚠ RISKY[/]"
+    if sm.ram_fit == RAMFit.OVER:
+        return "red", "[red]✗ DOES_NOT_FIT[/]"
+    return "dim", "[dim]? UNKNOWN[/]"
 
-        lines: list[str] = []
 
-        # Size / params / quant
-        size_str = f"{m.size_gb:.1f} GB" if m.size_gb > 0 else "size unknown"
-        quant_str = m.quantization if m.quantization != "unknown" else "quant unknown"
-        if sm.params_b is not None:
-            params_str = f"~{sm.params_b:g}B"
-        else:
-            params_str = "unknown"
+def _model_card_lines(
+    sm: EvaluatedModel,
+    *,
+    available_ram_gb: float | None,
+    verbose: bool,
+    suppress_system_warnings: bool,
+) -> list[str]:
+    m = sm.model
+    lines: list[str] = []
+
+    size_str = f"{m.size_gb:.1f} GB" if m.size_gb > 0 else "size unknown"
+    quant_str = m.quantization if m.quantization != "unknown" else "quant unknown"
+    params_str = f"~{sm.params_b:g}B" if sm.params_b is not None else "unknown"
+    lines.append(
+        f"[dim]Size:[/] {size_str}  "
+        f"[dim]Params:[/] {params_str}  "
+        f"[dim]Quant:[/] {quant_str}  "
+        f"[dim]Task:[/] {_category_display(sm)}"
+    )
+
+    labels_str = ", ".join(sm.label_names) if sm.labels else "—"
+    lines.append(f"[dim]Labels:[/] {labels_str}")
+
+    if sm.rank_reason:
+        lines.append(f"[dim]Evidence:[/] {sm.rank_reason}")
+
+    lines.append(
+        f"[dim]Pullable:[/] {'yes' if sm.installable else 'no'}  "
+        f"[dim]Runtime compatible:[/] {'yes' if sm.runtime_compatible else 'no'}  "
+        f"[dim]Hardware fit:[/] {_ram_fit_badge(sm.ram_fit)}  "
+        f"[dim]Mem confidence:[/] {_confidence_badge(sm.memory_confidence)}"
+    )
+
+    if sm.estimated_total_ram_gb > 0:
+        avail_str = f"{available_ram_gb:.1f} GB" if available_ram_gb is not None else "see system profile"
+        headroom = None
+        if available_ram_gb is not None:
+            headroom = available_ram_gb - sm.estimated_total_ram_gb
+        headroom_str = ""
+        if headroom is not None:
+            if headroom >= 0:
+                headroom_str = f"  [dim]Headroom:[/] ~{headroom:.1f} GB"
+            else:
+                headroom_str = f"  [dim]Shortfall:[/] ~{abs(headroom):.1f} GB"
         lines.append(
-            f"[dim]Size:[/] {size_str}  "
-            f"[dim]Params:[/] {params_str}  "
-            f"[dim]Quant:[/] {quant_str}  "
-            f"[dim]Categories:[/] {', '.join(m.categories) or '?'}"
+            f"[dim]Est. RAM needed (estimate):[/] ~{sm.estimated_total_ram_gb:.1f} GB  "
+            f"[dim]Available:[/] {avail_str}{headroom_str}"
         )
-
-        lines.append(f"[dim]Recommendation:[/] {labels_str}")
-
-        # Why listed here
-        if sm.rank_reason:
-            lines.append(f"[dim]Evidence:[/] {sm.rank_reason}")
-
-        # Separated concerns
-        lines.append(
-            f"[dim]Pullable:[/] {'yes' if sm.installable else 'no'}  "
-            f"[dim]Runtime compatible:[/] {'yes' if sm.runtime_compatible else 'no'}  "
-            f"[dim]Likely to fit:[/] {_ram_fit_badge(sm.ram_fit)}  "
-            f"[dim]Mem confidence:[/] {_confidence_badge(sm.memory_confidence)}"
-        )
-
-        # RAM budget
-        avail = available_ram_gb
-        if sm.estimated_total_ram_gb > 0:
-            avail_str = f"{avail:.1f} GB" if avail is not None else "see system profile"
-            lines.append(
-                f"[dim]Est. RAM needed:[/] ~{sm.estimated_total_ram_gb:.1f} GB  [dim]Available (system):[/] {avail_str}"
-            )
+        if verbose:
             lines.append(f"  [dim]{sm.ram_budget_note}[/]")
-        elif sm.missing_metadata:
-            lines.append(f"[dim]Missing metadata:[/] {', '.join(sm.missing_metadata)}")
+    elif sm.missing_metadata:
+        lines.append(f"[dim]Missing metadata:[/] {', '.join(sm.missing_metadata)}")
 
-        # Acceleration + performance
+    lines.append(
+        f"[dim]GPU detected:[/] {'yes' if sm.gpu_detected else 'no'}  "
+        f"[dim]LLM accel:[/] {_accel_badge(sm)}"
+    )
+    if sm.estimated_tps > 0:
         lines.append(
-            f"[dim]GPU detected:[/] {'yes' if sm.gpu_detected else 'no'}  [dim]LLM accel:[/] {_accel_badge(sm)}"
+            f"[dim]Performance (estimate):[/] ~{sm.estimated_tps:.1f} tok/s "
+            f"({_perf_basis_str(sm.performance_basis)})  "
+            f"[dim]Confidence:[/] {_confidence_badge(sm.tps_confidence)}"
         )
-        if sm.estimated_tps > 0:
-            lines.append(
-                f"[dim]Performance:[/] ~{sm.estimated_tps:.1f} tok/s "
-                f"({_perf_basis_str(sm.performance_basis)})  "
-                f"[dim]Confidence:[/] {_confidence_badge(sm.tps_confidence)}"
-            )
-        else:
-            lines.append(f"[dim]Performance:[/] unknown ({_perf_basis_str(sm.performance_basis)})")
+    elif sm.performance_basis == PerformanceBasis.UNKNOWN:
+        lines.append("[dim]Performance:[/] not estimated")
+    else:
+        lines.append(f"[dim]Performance:[/] unknown ({_perf_basis_str(sm.performance_basis)})")
 
+    if verbose:
         lines.append(f"[dim]Overall confidence:[/] {_confidence_badge(sm.confidence)}")
-
-        for line in sm.explanation[:5]:
+        for line in sm.explanation:
             lines.append(f"  [green]✔[/] {line}")
-
-        for w in sm.warnings[:4]:
+        for w in sm.warnings:
+            if suppress_system_warnings and _is_system_warning(w):
+                continue
             lines.append(f"  [yellow]⚠[/]  {w}")
-
         if m.known_issues:
             lines.append(f"  [red]⚠[/]  {len(m.known_issues)} open community bug report(s)")
+    else:
+        # Compact: at most two model-specific warnings
+        shown = 0
+        for w in sm.warnings:
+            if suppress_system_warnings and _is_system_warning(w):
+                continue
+            # Skip verbose UNVERIFIED boilerplate already covered by the UNKNOWN badge
+            if "UNVERIFIED: size/RAM metadata incomplete" in w:
+                continue
+            lines.append(f"  [yellow]⚠[/]  {w}")
+            shown += 1
+            if shown >= 2:
+                break
 
-        console.print(
-            Panel(
-                "\n".join(lines),
-                title=title,
-                border_style=border,
-                padding=(0, 1),
+    return lines
+
+
+def print_recommendations(
+    evaluated: list[EvaluatedModel],
+    top: int = 5,
+    available_ram_gb: float | None = None,
+    verbose: bool = False,
+) -> None:
+    console.print()
+    console.rule("[bold cyan]Model Compatibility[/]")
+
+    recommended, potential, advisory = partition_recommendations(evaluated)
+
+    # Hardware-level notes once (avoid repeating iGPU / accel warnings on every card)
+    system_notes: list[str] = []
+    seen_notes: set[str] = set()
+    for sm in evaluated[: max(top * 2, 10)]:
+        for w in sm.warnings:
+            if _is_system_warning(w) and w not in seen_notes:
+                seen_notes.add(w)
+                system_notes.append(w)
+    if system_notes:
+        console.print("\n[bold]Hardware notes[/] [dim](apply to all candidates)[/]")
+        for note in system_notes:
+            console.print(f"  [yellow]⚠[/]  {note}")
+
+    if advisory:
+        console.print(f"\n[bold yellow]{advisory}[/]")
+
+    # Cap each section so the summary stays scannable
+    rec_limit = top
+    pot_limit = top if not recommended else max(2, top // 2)
+
+    if recommended:
+        console.print("\n[bold green]Recommended models[/] [dim](verified FITS / TIGHT)[/]")
+        for shown, sm in enumerate(recommended[:rec_limit], start=1):
+            border, fit_label = _fit_title_badge(sm)
+            verified_badge = "[green]verified[/]"
+            install_badge = "[green]● ollama pull[/]" if sm.model.ollama_pullable else "[yellow]● manual download[/]"
+            title = (
+                f"[bold]#{shown}[/]  [white]{sm.model.full_tag}[/]  "
+                f"{fit_label}  {verified_badge}  {install_badge}"
             )
+            body = "\n".join(
+                _model_card_lines(
+                    sm,
+                    available_ram_gb=available_ram_gb,
+                    verbose=verbose,
+                    suppress_system_warnings=True,
+                )
+            )
+            console.print(Panel(body, title=title, border_style=border, padding=(0, 1)))
+    else:
+        console.print(
+            "\n[bold yellow]Recommended models:[/] none — "
+            "no candidate is verified to fit available memory."
         )
+
+    show_potential = potential[:pot_limit]
+    if show_potential:
+        console.print(
+            "\n[bold]Potential candidates[/] "
+            "[dim](unverified, RISKY, or incomplete metadata — not confirmed fits)[/]"
+        )
+        for sm in show_potential:
+            border, fit_label = _fit_title_badge(sm)
+            verified_badge = "[green]verified[/]" if sm.verified else "[dim]UNVERIFIED[/]"
+            install_badge = "[green]● ollama pull[/]" if sm.model.ollama_pullable else "[yellow]● manual download[/]"
+            # No forced #1 winner numbering for potential candidates
+            title = f"[white]{sm.model.full_tag}[/]  {fit_label}  {verified_badge}  {install_badge}"
+            body = "\n".join(
+                _model_card_lines(
+                    sm,
+                    available_ram_gb=available_ram_gb,
+                    verbose=verbose,
+                    suppress_system_warnings=True,
+                )
+            )
+            console.print(Panel(body, title=title, border_style=border, padding=(0, 1)))
+
+    if not recommended and not show_potential:
+        console.print("[yellow]No suitable candidates to display for this hardware profile.[/]")
+
+    if not verbose:
+        console.print("\n[dim]Tip: re-run with [cyan]-v[/] / [cyan]--verbose[/] for full diagnostics per model.[/]")
 
 
 def print_download_result(result_code, message: str) -> None:

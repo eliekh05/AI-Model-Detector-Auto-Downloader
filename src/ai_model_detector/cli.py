@@ -31,7 +31,7 @@ from .display import (
 from .downloader import list_installed_models, pull_model, start_ollama_serve
 from .registry import fetch_registry
 from .scanner import scan_system
-from .scorer import RAMFit, rank_models, select_install_candidate
+from .scorer import RAMFit, partition_recommendations, rank_models, select_install_candidate
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +53,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--category",
         metavar="CATEGORY",
-        help="Filter recommendations by category: chat, code, vision, math, reasoning, embedding",
+        help=(
+            "Filter by task category: asr, audio, chat, coding, reasoning, "
+            "embeddings, vision, translation, multimodal, unknown"
+        ),
     )
     parser.add_argument(
         "--top",
@@ -108,15 +111,25 @@ def _interactive_install(ranked, top_n: int) -> None:
     Offer install with safe defaults.
 
     - Prefer a verified FITS/TIGHT model as the y/n default.
-    - If the top-ranked model is UNKNOWN/RISKY, explain and require override
-      to install it instead of the safer alternative.
+    - If nothing is verified to fit, say so and require override.
     - Never download without confirmation.
     """
+    if not sys.stdin.isatty():
+        console.print(
+            "\n[dim]Non-interactive session — skipping download prompts. "
+            "Re-run in a terminal to install.[/]"
+        )
+        return
+
     default, risky_top, advisory = select_install_candidate(ranked)
+    recommended, potential, partition_advisory = partition_recommendations(ranked)
     pullable = [sm for sm in ranked if sm.installable]
+    recommended_tags = {sm.model.full_tag for sm in recommended}
 
     console.print()
-    if advisory:
+    if not recommended:
+        console.print(f"[yellow]{partition_advisory or advisory}[/]")
+    elif advisory:
         console.print(f"[yellow]{advisory}[/]")
 
     if default is not None:
@@ -145,10 +158,6 @@ def _interactive_install(ranked, top_n: int) -> None:
             _confirm_and_pull(risky_top.model.full_tag)
             return
     elif risky_top is not None:
-        console.print(
-            "[yellow]No verified model currently fits the available memory. "
-            "Automatic installation is disabled.[/]"
-        )
         if Confirm.ask(
             f"[bold red]Override[/] and install "
             f"[cyan]{risky_top.model.full_tag}[/] "
@@ -164,16 +173,25 @@ def _interactive_install(ranked, top_n: int) -> None:
         )
         return
 
-    # Manual pick from pullable list
+    # Manual pick from pullable list (recommended first, then potential)
     if not pullable:
         return
 
-    pullable_choices = {str(i + 1): sm for i, sm in enumerate(pullable[:top_n])}
+    ordered_pullable = [sm for sm in recommended if sm.installable] + [
+        sm for sm in potential if sm.installable
+    ]
+    if not ordered_pullable:
+        ordered_pullable = pullable[:top_n]
+
+    pullable_choices = {str(i + 1): sm for i, sm in enumerate(ordered_pullable[:top_n])}
     console.print("\n[dim]Ollama-installable options:[/]")
     for k, sm in pullable_choices.items():
         flag = "verified" if sm.verified else "UNVERIFIED"
+        section = "recommended" if sm.model.full_tag in recommended_tags else "potential"
         labels = ", ".join(sm.label_names[:2]) if sm.labels else "—"
-        console.print(f"  [{k}] {sm.model.full_tag}  ({sm.ram_fit.value}, {flag}; {labels})")
+        console.print(
+            f"  [{k}] {sm.model.full_tag}  ({sm.ram_fit.value}, {flag}, {section}; {labels})"
+        )
     console.print("  [s] Skip / exit\n")
 
     choice = Prompt.ask(
@@ -301,6 +319,7 @@ def run() -> None:
                     "will_use_gpu": sm.will_use_gpu,
                     "labels": sm.label_names,
                     "rank_reason": sm.rank_reason,
+                    "category_source": getattr(sm.model, "category_source", "unknown"),
                     "explanation": sm.explanation,
                     "warnings": sm.warnings,
                 }
@@ -315,12 +334,13 @@ def run() -> None:
         ranked,
         top=args.top,
         available_ram_gb=profile.ram.available_gb,
+        verbose=args.verbose,
     )
 
     # ── Interactive download ──────────────────────────────────────────────────
     _interactive_install(ranked, args.top)
 
-    console.print("\n[dim]Done. Run [cyan]ollama run <model>[/] to start chatting.[/]\n")
+    console.print("\n[dim]Done. Run [cyan]ollama run <model>[/] to use an installed model.[/]\n")
 
 
 if __name__ == "__main__":

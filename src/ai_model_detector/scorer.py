@@ -703,19 +703,30 @@ def evaluate_model(model: ModelInfo, profile: SystemProfile) -> EvaluatedModel:
     elif quant == "unknown":
         warnings.append("Quantization unknown — quality and memory density cannot be assessed.")
 
-    # ── Speed estimate ──────────────────────────────────────────────────────
-    est_tps, tps_conf, perf_basis = _estimate_tokens_per_sec(
-        model, profile, gpu_tier, ram_fit, params_b, effective_size
-    )
-    if est_tps > 0:
+    # ── Speed estimate (LLM tok/s — not applicable to ASR/audio/embeddings) ─
+    task_cats = {c.lower() for c in model.categories}
+    non_llm_tasks = task_cats & {"asr", "audio", "embeddings", "embedding", "translation"}
+    if non_llm_tasks and "chat" not in task_cats and "coding" not in task_cats and "code" not in task_cats:
+        est_tps, tps_conf, perf_basis = 0.0, Confidence.UNKNOWN, PerformanceBasis.UNKNOWN
         explanation.append(
-            f"Performance {perf_basis.value}: ~{est_tps:.1f} tok/s "
-            f"(confidence {tps_conf.value}); not a measured benchmark."
+            f"Performance: not estimated as chat tok/s — task categorized as "
+            f"{', '.join(sorted(non_llm_tasks))}."
         )
-        if est_tps < 2:
-            warnings.append(f"Estimated speed ~{est_tps:.1f} tok/s ({perf_basis.value}) — may feel slow interactively.")
     else:
-        warnings.append("Performance: unknown — insufficient metadata for a speed estimate.")
+        est_tps, tps_conf, perf_basis = _estimate_tokens_per_sec(
+            model, profile, gpu_tier, ram_fit, params_b, effective_size
+        )
+        if est_tps > 0:
+            explanation.append(
+                f"Performance {perf_basis.value}: ~{est_tps:.1f} tok/s "
+                f"(confidence {tps_conf.value}); not a measured benchmark."
+            )
+            if est_tps < 2:
+                warnings.append(
+                    f"Estimated speed ~{est_tps:.1f} tok/s ({perf_basis.value}) — may feel slow interactively."
+                )
+        else:
+            warnings.append("Performance: unknown — insufficient metadata for a speed estimate.")
 
     # ── Known issues / popularity (weak signals, not scores) ────────────────
     if model.known_issues:
@@ -895,6 +906,9 @@ def _assign_recommendation_labels(ranked: list[EvaluatedModel]) -> None:
             sm.labels.append(RecommendationLabel.REASONING)
         if "chat" in cats or "general" in cats:
             sm.labels.append(RecommendationLabel.GENERAL_CHAT)
+        # Task-specialized models should not pick up a chat label from empty defaults
+        if cats & {"asr", "audio", "embeddings", "embedding", "translation"}:
+            sm.labels = [lb for lb in sm.labels if lb != RecommendationLabel.GENERAL_CHAT]
 
         if sm.disqualified or sm.ram_fit == RAMFit.OVER:
             if RecommendationLabel.NOT_RECOMMENDED not in sm.labels:
@@ -905,6 +919,43 @@ def _assign_recommendation_labels(ranked: list[EvaluatedModel]) -> None:
             sm.labels.append(RecommendationLabel.EXPERIMENTAL)
 
 
+def partition_recommendations(
+    ranked: list[EvaluatedModel],
+) -> tuple[list[EvaluatedModel], list[EvaluatedModel], str | None]:
+    """
+    Split evaluated models into verified recommendations vs potential candidates.
+
+    Recommended: verified FITS / TIGHT only (never UNKNOWN-as-FITS).
+    Potential: RISKY / UNKNOWN / unverified — discoverable but not claimed fits.
+    DOES_NOT_FIT / disqualified are omitted from both lists.
+
+    Returns (recommended, potential, advisory_message).
+    """
+    recommended = [
+        sm
+        for sm in ranked
+        if sm.verified and not sm.disqualified and sm.ram_fit in (RAMFit.FITS, RAMFit.TIGHT)
+    ]
+    rec_tags = {sm.model.full_tag for sm in recommended}
+    potential = [
+        sm
+        for sm in ranked
+        if sm.model.full_tag not in rec_tags
+        and not sm.disqualified
+        and sm.ram_fit != RAMFit.OVER
+        and (sm.unverified or sm.ram_fit in (RAMFit.UNKNOWN, RAMFit.RISKY) or not sm.verified)
+    ]
+
+    advisory: str | None = None
+    if not recommended:
+        advisory = (
+            "No verified model currently fits the available memory. "
+            "Nothing below is a confirmed recommendation — "
+            "potential candidates need more evidence or free RAM."
+        )
+    return recommended, potential, advisory
+
+
 def rank_models(
     models: list[ModelInfo],
     profile: SystemProfile,
@@ -913,7 +964,15 @@ def rank_models(
 ) -> list[EvaluatedModel]:
     """Evaluate and order models by compatibility classifications (no numeric score)."""
     if category_filter:
-        models = [m for m in models if category_filter in m.categories]
+        from .registry import normalize_category
+
+        want = normalize_category(category_filter)
+        models = [
+            m
+            for m in models
+            if want in {normalize_category(c) for c in m.categories}
+            or (want == "unknown" and (not m.categories or m.categories == ["unknown"]))
+        ]
 
     disk_free = profile.disk.free_gb if profile.disk else 999.0
     candidates = [m for m in models if m.size_gb == 0 or m.size_gb <= disk_free * 0.95]

@@ -13,14 +13,15 @@ from ai_model_detector.scanner import (
 
 
 def profile_intel_mac_8gb(
-    available_gb: float = 2.2,
+    available_gb: float = 2.4,
     total_gb: float = 8.0,
 ) -> SystemProfile:
     """
     Intel MacBook-class profile matching the reported test machine:
-      - 8 GB total RAM / ~2.2 GB available
+      - 8 GB total RAM / ~2.4 GB available
       - Intel i5-8257U, AVX2
-      - Intel Iris Plus Graphics 645 (integrated)
+      - Intel Iris Plus Graphics 645 (integrated, Metal detected)
+      - Ollama present; LLM acceleration unverified for iGPU
     """
     return SystemProfile(
         os_name="Darwin",
@@ -52,7 +53,7 @@ def profile_intel_mac_8gb(
         ],
         disk=DiskProfile(free_gb=120.0, total_gb=256.0, mount="/"),
         ollama_installed=True,
-        ollama_version="0.5.0",
+        ollama_version="0.34.2",
         source="test_fixture",
     )
 
@@ -70,6 +71,7 @@ def make_model(
     ollama_pull_count: int = 1000,
     known_issues: list[str] | None = None,
     categories: list[str] | None = None,
+    category_source: str = "unknown",
     description: str = "test model",
 ) -> ModelInfo:
     return ModelInfo(
@@ -81,7 +83,8 @@ def make_model(
         vram_required_gb=vram_required_gb,
         quantization=quantization,
         description=description,
-        categories=categories or ["chat"],
+        categories=categories if categories is not None else ["unknown"],
+        category_source=category_source,
         known_issues=known_issues or [],
         ollama_pullable=ollama_pullable,
         ollama_pull_count=ollama_pull_count,
