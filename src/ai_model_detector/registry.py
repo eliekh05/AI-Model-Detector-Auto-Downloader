@@ -374,9 +374,10 @@ def infer_task_categories(
         )
     ) or re.search(r"(?<![a-z])asr(?![a-z])", text_for_task) or "-asr-" in text_for_task or text_for_task.endswith("-asr"):
         inferred.append("asr")
-    if any(kw in text_for_task for kw in ("text-to-speech", "tts", "audio generation", "voice clone")) and "asr" not in inferred:
-        inferred.append("audio")
-    elif (
+    if (
+        any(kw in text_for_task for kw in ("text-to-speech", "tts", "audio generation", "voice clone"))
+        and "asr" not in inferred
+    ) or (
         "audio" in text_for_task
         and not inferred
         and any(kw in text_for_task for kw in ("speech", "sound", "voice", "waveform"))

@@ -256,7 +256,7 @@ def _interactive_install(ranked, top_n: int, available_ram_gb: float = 0.0) -> N
         print(
             f"  [{k}] {sm.model.full_tag}  ({sm.ram_fit.value}, {flag}, {section}; {labels}){ram_note}"
         )
-    print(f"  [s] Skip / exit\n")
+    print("  [s] Skip / exit\n")
 
     choice = _prompt_choice(
         "Enter number to install, or 's' to skip",

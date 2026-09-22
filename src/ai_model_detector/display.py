@@ -178,7 +178,7 @@ def print_system_profile(profile: SystemProfile) -> None:
         ))
 
     if profile.ollama_installed:
-        ollama_status = _green(f"✓ Installed") + f" ({profile.ollama_version})"
+        ollama_status = _green("✓ Installed") + f" ({profile.ollama_version})"
     else:
         ollama_status = _yellow("✗ Not found — will guide installation")
     rows.append(("Ollama", ollama_status))
@@ -432,7 +432,7 @@ def _print_card(title: str, body_lines: list[str], border_style: str = "dim") ->
             clean = clean.replace(code, "")
         vis_len = len(clean)
         pad = max(0, width - vis_len - 2)
-        print(color_func(f"│ ") + line + " " * pad + color_func("│"))
+        print(color_func("│ ") + line + " " * pad + color_func("│"))
     print(color_func(f"└{border_char * width}┘"))
 
 
@@ -585,7 +585,7 @@ class spinner:
         self._thread.start()
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, *_exc):
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=1)
