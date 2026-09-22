@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-model-detector"
-version = "1.5.0"
+dynamic = ["version"]
 description = "Deep hardware scanner that recommends and auto-downloads the best local AI model for your system"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -48,6 +48,9 @@ where = ["src"]
 
 [tool.setuptools.package-dir]
 "" = "src"
+
+[tool.setuptools.dynamic]
+version = { attr = "ai_model_detector.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
