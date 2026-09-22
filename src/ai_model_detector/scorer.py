@@ -271,12 +271,21 @@ def estimate_memory(model: ModelInfo, profile: SystemProfile, gpu_tier: GPUTier)
 
 
 def _classify_fit(total_required: float, profile: SystemProfile) -> RAMFit:
-    """Map required GB onto FITS / TIGHT / RISKY / DOES_NOT_FIT using total vs available RAM."""
+    """Map required GB onto FITS / TIGHT / RISKY / DOES_NOT_FIT using total vs available RAM.
+
+    Equal-or-less than available is NOT automatically FITS — there must be
+    meaningful headroom because available RAM is a snapshot and doesn't
+    account for all runtime/context/OS allocations at load time.
+    """
     total_ram = profile.ram.total_gb
     avail_ram = profile.ram.available_gb
 
-    if total_required <= avail_ram:
+    # Require meaningful headroom (>5% of available) for FITS
+    if total_required < avail_ram * 0.95:
         return RAMFit.FITS
+    if total_required <= avail_ram:
+        # Estimated RAM is within 5% of available — no practical headroom
+        return RAMFit.TIGHT
     if total_required <= avail_ram * 1.25:
         return RAMFit.TIGHT
     if total_required <= total_ram * 0.90:

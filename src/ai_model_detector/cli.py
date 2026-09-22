@@ -179,8 +179,12 @@ def _interactive_install(ranked, top_n: int, available_ram_gb: float = 0.0) -> N
             return ""
         avail = available_ram_gb
         shortfall = sm.estimated_total_ram_gb - avail
-        if shortfall > 0:
-            return (f"  {_ansi('dim')}Estimated {shortfall:.1f} GB shortfall "
+        if shortfall > 0.2:
+            return (f"  {_ansi('red')}Estimated {shortfall:.1f} GB shortfall "
+                    f"({sm.estimated_total_ram_gb:.1f} GB needed, {avail:.1f} GB available). "
+                    f"Metadata confidence: {sm.memory_confidence.value}.{_ansi('reset')}")
+        if shortfall > -0.2:
+            return (f"  {_ansi('yellow')}No practical headroom (~0 GB free). "
                     f"({sm.estimated_total_ram_gb:.1f} GB needed, {avail:.1f} GB available). "
                     f"Metadata confidence: {sm.memory_confidence.value}.{_ansi('reset')}")
         return (f"  {_ansi('dim')}Estimated {abs(shortfall):.1f} GB headroom "
@@ -251,8 +255,10 @@ def _interactive_install(ranked, top_n: int, available_ram_gb: float = 0.0) -> N
         ram_note = ""
         if sm.estimated_total_ram_gb > 0:
             shortfall = sm.estimated_total_ram_gb - available_ram_gb
-            if shortfall > 0:
-                ram_note = f" ⚠ ~{shortfall:.1f} GB shortfall"
+            if shortfall > 0.2:
+                ram_note = f" {_ansi('red')}⚠ ~{shortfall:.1f} GB shortfall{_ansi('reset')}"
+            elif shortfall > -0.2:
+                ram_note = f" {_ansi('yellow')}⚠ no headroom{_ansi('reset')}"
         print(
             f"  [{k}] {sm.model.full_tag}  ({sm.ram_fit.value}, {flag}, {section}; {labels}){ram_note}"
         )

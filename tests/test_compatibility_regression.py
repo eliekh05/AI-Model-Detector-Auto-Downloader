@@ -581,10 +581,10 @@ def test_unknown_never_treated_as_fits(intel_8gb):
 # ── 2.0.0 specific tests ──────────────────────────────────────────────────
 
 
-def test_version_is_2_0_0():
-    """Version must be 2.0.0."""
+def test_version_is_2_1_0():
+    """Version must be 2.1.0."""
     from ai_model_detector import __version__
-    assert __version__ == "2.0.0"
+    assert __version__ == "2.1.0"
 
 
 def test_no_third_party_runtime_imports():
@@ -615,3 +615,17 @@ def test_scan_system_works():
     assert profile.cpu.cores_physical >= 1
     assert profile.ram.total_gb > 0
     assert profile.ram.available_gb >= 0
+
+
+def test_fits_requires_headroom(intel_8gb):
+    """FITS requires meaningful headroom — estimated RAM equal to available must be TIGHT, not FITS."""
+    from ai_model_detector.scorer import _classify_fit
+    # Create a profile where available RAM is exactly what a model needs
+    from tests.hardware_fixtures import profile_intel_mac_8gb
+    tight_profile = profile_intel_mac_8gb(available_gb=1.5, total_gb=8.0)
+    # Model needing ~1.5 GB should be TIGHT (no headroom), not FITS
+    fit = _classify_fit(1.5, tight_profile)
+    assert fit == RAMFit.TIGHT, f"Expected TIGHT for exact-fit, got {fit.value}"
+    # Model needing 20% less should be FITS (has headroom)
+    fit2 = _classify_fit(1.2, tight_profile)
+    assert fit2 == RAMFit.FITS, f"Expected FITS with headroom, got {fit2.value}"

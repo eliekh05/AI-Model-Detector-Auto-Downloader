@@ -342,10 +342,12 @@ def _model_card_lines(
             headroom = available_ram_gb - sm.estimated_total_ram_gb
         headroom_str = ""
         if headroom is not None:
-            if headroom >= 0:
+            if headroom > 0.2:
                 headroom_str = f"  {_dim('Headroom:')} ~{headroom:.1f} GB"
+            elif headroom > -0.2:
+                headroom_str = f"  {_yellow('No practical headroom')} (~0 GB free)"
             else:
-                headroom_str = f"  {_dim('Shortfall:')} ~{abs(headroom):.1f} GB"
+                headroom_str = f"  {_red('Shortfall:')} ~{abs(headroom):.1f} GB"
         lines.append(
             f"{_dim('Est. RAM needed (estimate):')} ~{sm.estimated_total_ram_gb:.1f} GB  "
             f"{_dim('Available:')} {avail_str}{headroom_str}"
